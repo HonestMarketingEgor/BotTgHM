@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
+import time
+import traceback
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, Router
@@ -28,6 +32,35 @@ _MAXON_JOKE_REPLY = (
     "Медведь увидел в лесу горящую машину, сел в неё — и тоже сгорел."
 )
 
+_DEBUG_LOG_PATH = "/Users/pelemenio/telegram-context-bot/.cursor/debug-d35d78.log"
+_DEBUG_SESSION_ID = "d35d78"
+
+
+def _debug_log(
+    *,
+    run_id: str,
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict | None = None,
+) -> None:
+    # #region agent log
+    payload = {
+        "sessionId": _DEBUG_SESSION_ID,
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data or {},
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
 
 def _is_maxon_joke_request(text: str) -> bool:
     if not (text or "").strip():
@@ -35,6 +68,65 @@ def _is_maxon_joke_request(text: str) -> bool:
     t = (text or "").casefold().replace("\u00a0", " ").replace("\u202f", " ")
     t = " ".join(t.split())
     return "шутка максона" in t
+
+
+def _is_bot_alive_ping(question: str) -> bool:
+    """Короткий «жив ли бот» без вызова LLM — не зависит от OpenAI."""
+    q = (question or "").strip().lower().replace("ё", "е")
+    q = " ".join(q.split())
+    if len(q) > 120 or extract_urls(question):
+        return False
+    # «ты активен?», «ты работаешь?», «ты активен, работаешь?», «бот ок?»
+    if re.fullmatch(
+        r"(ты\s+)?(активен|работаешь|на\s+связи|жив(?:ой)?)"
+        r"(?:\s*,\s*(активен|работаешь))?\s*\??",
+        q,
+    ):
+        return True
+    return bool(re.fullmatch(r"(бот\s+)?(в\s+строю|ок|alive|ping)\??", q))
+
+
+def _openai_failure_reply(exc: BaseException) -> str | None:
+    """Возвращает текст для пользователя для типичных ошибок API; иначе None."""
+    err = f"{type(exc).__name__}: {exc}".lower()
+    if (
+        "401" in err
+        or "invalid_api_key" in err
+        or "authentication" in err
+        or "incorrect api key" in err
+        or "permission denied" in err
+    ):
+        return (
+            "Не удалось обратиться к OpenAI: похоже, неверный, просроченный или неактивный "
+            "`OPENAI_API_KEY`.\nПроверь ключ в `.env` на сервере и лимиты на "
+            "https://platform.openai.com/api-keys"
+        )
+    if "403" in err and ("model" in err or "access" in err or "country" in err):
+        return (
+            "OpenAI отклонил запрос (403): у ключа нет доступа к модели или региону.\n"
+            "Проверь `OPENAI_MODEL` в `.env` и настройки аккаунта на platform.openai.com."
+        )
+    if (
+        "model" in err
+        and (
+            "does not exist" in err
+            or "not found" in err
+            or "model_not_found" in err
+            or "invalid model" in err
+        )
+    ):
+        return (
+            "Указанная модель OpenAI недоступна для этого ключа.\n"
+            "Проверь `OPENAI_MODEL` в `.env` (например `gpt-4o-mini`)."
+        )
+    if "insufficient_quota" in err or "429" in err or "rate limit" in err:
+        return None
+    if "connection" in err or "timeout" in err or "connecterror" in err or "network" in err:
+        return (
+            "Не удалось связаться с серверами OpenAI (сеть / таймаут).\n"
+            "Повтори запрос позже или проверь интернет на машине, где запущен бот."
+        )
+    return None
 
 
 async def main() -> None:
@@ -109,6 +201,25 @@ async def main() -> None:
 
     async def answer_question(message: Message, question: str) -> None:
         question = (question or "").strip()
+        debug_run_id = (
+            f"ask-{message.chat.id}-{getattr(message, 'message_id', 'na')}-{int(time.time())}"
+        )
+        # #region agent log
+        _debug_log(
+            run_id=debug_run_id,
+            hypothesis_id="H1_input_or_branch",
+            location="bot.py:answer_question_entry",
+            message="answer_question entry",
+            data={
+                "chat_id": message.chat.id if message.chat else None,
+                "from_user_id": message.from_user.id if message.from_user else None,
+                "question_len": len(question),
+                "is_bot_alive_ping": _is_bot_alive_ping(question),
+                "has_text": bool(message.text),
+                "has_caption": bool(getattr(message, "caption", None)),
+            },
+        )
+        # #endregion
         if not question:
             # If user sent media (photo/etc.) via mention, still run analysis.
             media = extract_media_metadata(message)
@@ -126,6 +237,13 @@ async def main() -> None:
             await message.reply(_MAXON_JOKE_REPLY)
             return
 
+        if _is_bot_alive_ping(question):
+            await message.reply(
+                "Да, я на связи. Если «умные» ответы не приходят — проверь `OPENAI_API_KEY` "
+                "и биллинг на https://platform.openai.com (логи процесса бота покажут точную ошибку)."
+            )
+            return
+
         def _sanitize_llm_answer(candidate: str) -> str:
             # Only remove clearly forbidden phrases; formatting is left to the model.
             bad_phrases = ["из предоставленного контекста", "возможно", "вероятно"]
@@ -136,9 +254,20 @@ async def main() -> None:
 
         session_id: int | None = None
         action_kb: InlineKeyboardMarkup | None = None
+        phase = "before_try"
 
         try:
+            phase = "send_thinking"
             await message.reply("Thinking…")
+            # #region agent log
+            _debug_log(
+                run_id=debug_run_id,
+                hypothesis_id="H2_pre_llm_failure",
+                location="bot.py:after_thinking_reply",
+                message="thinking message sent",
+                data={"chat_id": message.chat.id if message.chat else None},
+            )
+            # #endregion
             async def _typing_loop() -> None:
                 # Telegram typing indicator for user feedback during long calls.
                 while True:
@@ -331,12 +460,27 @@ async def main() -> None:
             # If we have extracted images (Drive and/or Telegram), prefer multimodal analysis.
             has_images = (len(drive_image_data_urls) + len(telegram_image_data_urls)) > 0
 
+            phase = "create_ask_session"
             session_id = await db.create_ask_session(
                 chat_id=message.chat.id,
                 user_id=message.from_user.id,
                 question=effective_question,
                 selected_lines=selected_lines,
             )
+            # #region agent log
+            _debug_log(
+                run_id=debug_run_id,
+                hypothesis_id="H3_db_or_context",
+                location="bot.py:after_create_ask_session",
+                message="ask session created",
+                data={
+                    "session_id": session_id,
+                    "selected_lines_count": len(selected_lines),
+                    "has_images": has_images,
+                    "urls_count": len(urls),
+                },
+            )
+            # #endregion
             action_kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -378,6 +522,7 @@ async def main() -> None:
                 return
 
             try:
+                phase = "llm_call"
                 if has_images:
                     answer = await llm.answer_question_with_images(
                         question=effective_question,
@@ -393,13 +538,43 @@ async def main() -> None:
                         context_messages=selected_lines,
                     )
             except Exception as e:
-                # If OpenAI quota is exhausted, fall back to excerpts
-                # instead of returning an error to the chat.
-                msg = str(e).lower()
-                if "429" in msg or "insufficient_quota" in msg or "quota" in msg:
+                err_low = str(e).lower()
+                print(f"[answer_question] OpenAI error: {type(e).__name__}: {e}", flush=True)
+                # #region agent log
+                _debug_log(
+                    run_id=debug_run_id,
+                    hypothesis_id="H4_llm_error_path",
+                    location="bot.py:llm_except",
+                    message="llm exception caught",
+                    data={
+                        "exc_type": type(e).__name__,
+                        "exc_str": str(e)[:300],
+                        "err_low_snippet": err_low[:200],
+                        "phase": phase,
+                    },
+                )
+                # #endregion
+                # Quota: fall back to rule-based answer instead of failing the chat.
+                if (
+                    "429" in err_low
+                    or "insufficient_quota" in err_low
+                    or "quota" in err_low
+                    or "rate_limit" in err_low
+                ):
                     out = build_freeform_answer(effective_question, selected_lines)
                     sent = await message.answer(
                         out, reply_markup=action_kb, disable_web_page_preview=True
+                    )
+                    await db.map_bot_message_to_session(
+                        chat_id=message.chat.id,
+                        bot_message_id=sent.message_id,
+                        session_id=session_id,
+                    )
+                    return
+                hint = _openai_failure_reply(e)
+                if hint:
+                    sent = await message.answer(
+                        hint, reply_markup=action_kb, disable_web_page_preview=True
                     )
                     await db.map_bot_message_to_session(
                         chat_id=message.chat.id,
@@ -422,6 +597,22 @@ async def main() -> None:
                 session_id=session_id,
             )
         except Exception as e:
+            print(f"[answer_question] fatal: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+            # #region agent log
+            _debug_log(
+                run_id=debug_run_id,
+                hypothesis_id="H5_outer_fatal",
+                location="bot.py:outer_except",
+                message="fatal exception caught",
+                data={
+                    "exc_type": type(e).__name__,
+                    "exc_str": str(e)[:300],
+                    "action_kb_set": action_kb is not None,
+                    "phase": phase,
+                },
+            )
+            # #endregion
             out = "\n".join(
                 [
                     "📊 Ошибка:",
@@ -429,6 +620,7 @@ async def main() -> None:
                     "— Проверьте настройки и попробуйте ещё раз.",
                     "— Уточните вопрос, чтобы ответ был точнее.",
                     "⚠️ Вывод: Повторите запрос.",
+                    f"— Технически: {type(e).__name__}",
                 ]
             )
             if action_kb is not None:
