@@ -1,0 +1,30 @@
+# После каждого push в main подключается к серверу по SSH,
+# обновляет код из GitHub и выполняет твою команду перезапуска (секрет DEPLOY_POST_PULL).
+name: Deploy bot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-bot
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH — git pull + перезапуск
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.DEPLOY_PATH }}"
+            git fetch origin
+            git reset --hard origin/main
+            ${{ secrets.DEPLOY_POST_PULL }}
