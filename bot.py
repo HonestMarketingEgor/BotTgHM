@@ -560,6 +560,8 @@ async def main() -> None:
                     or "insufficient_quota" in err_low
                     or "quota" in err_low
                     or "rate_limit" in err_low
+                    or "unsupported_country_region_territory" in err_low
+                    or ("request_forbidden" in err_low and "country" in err_low)
                 ):
                     out = build_freeform_answer(effective_question, selected_lines)
                     sent = await message.answer(
