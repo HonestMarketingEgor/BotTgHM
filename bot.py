@@ -24,6 +24,18 @@ from links import extract_urls, fetch_url_text, fetch_google_drive_folder_image_
 import httpx
 from table_kpis import build_numbers_from_link_context
 
+_MAXON_JOKE_REPLY = (
+    "Медведь увидел в лесу горящую машину, сел в неё — и тоже сгорел."
+)
+
+
+def _is_maxon_joke_request(text: str) -> bool:
+    if not (text or "").strip():
+        return False
+    t = (text or "").casefold().replace("\u00a0", " ").replace("\u202f", " ")
+    t = " ".join(t.split())
+    return "шутка максона" in t
+
 
 async def main() -> None:
     cfg = load_config()
@@ -109,6 +121,10 @@ async def main() -> None:
                     "Usage: `/ask <question>`", parse_mode="Markdown"
                 )
                 return
+
+        if _is_maxon_joke_request(question):
+            await message.reply(_MAXON_JOKE_REPLY)
+            return
 
         def _sanitize_llm_answer(candidate: str) -> str:
             # Only remove clearly forbidden phrases; formatting is left to the model.
@@ -603,10 +619,8 @@ async def main() -> None:
             stripped = strip_bot_mention(raw)
             t = (stripped or "").strip().lower()
 
-            if "шутка максона" in t:
-                await message.reply(
-                    "Медведь увидел в лесу горящую машину, сел в неё — и тоже сгорел."
-                )
+            if _is_maxon_joke_request(stripped):
+                await message.reply(_MAXON_JOKE_REPLY)
             else:
                 # Allow either "@bot /ask <q>" or "@bot <q>" formats.
                 if t.startswith("/ask"):
