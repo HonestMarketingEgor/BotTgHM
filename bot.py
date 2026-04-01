@@ -603,13 +603,18 @@ async def main() -> None:
             stripped = strip_bot_mention(raw)
             t = (stripped or "").strip().lower()
 
-            # Allow either "@bot /ask <q>" or "@bot <q>" formats.
-            if t.startswith("/ask"):
-                parts = stripped.split(maxsplit=1)
-                question = parts[1].strip() if len(parts) > 1 else ""
+            if "шутка максона" in t:
+                await message.reply(
+                    "Медведь увидел в лесу горящую машину, сел в неё — и тоже сгорел."
+                )
             else:
-                question = stripped
-            await answer_question(message, question)
+                # Allow either "@bot /ask <q>" or "@bot <q>" formats.
+                if t.startswith("/ask"):
+                    parts = stripped.split(maxsplit=1)
+                    question = parts[1].strip() if len(parts) > 1 else ""
+                else:
+                    question = stripped
+                await answer_question(message, question)
 
         created_at_ts = int(message.date.timestamp())
 
