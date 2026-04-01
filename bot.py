@@ -89,6 +89,9 @@ def _is_bot_alive_ping(question: str) -> bool:
 def _openai_failure_reply(exc: BaseException) -> str | None:
     """Возвращает текст для пользователя для типичных ошибок API; иначе None."""
     err = f"{type(exc).__name__}: {exc}".lower()
+    if "unsupported_country_region_territory" in err:
+        # Region-restricted account should use local fallback answer path.
+        return None
     if (
         "401" in err
         or "invalid_api_key" in err
@@ -563,6 +566,10 @@ async def main() -> None:
                     or "unsupported_country_region_territory" in err_low
                     or ("request_forbidden" in err_low and "country" in err_low)
                 ):
+                    print(
+                        "[answer_question] fallback_rule_based: llm region/quota restriction",
+                        flush=True,
+                    )
                     out = build_freeform_answer(effective_question, selected_lines)
                     sent = await message.answer(
                         out, reply_markup=action_kb, disable_web_page_preview=True
@@ -575,6 +582,7 @@ async def main() -> None:
                     return
                 hint = _openai_failure_reply(e)
                 if hint:
+                    print("[answer_question] hint_reply_to_user: openai_failure_reply", flush=True)
                     sent = await message.answer(
                         hint, reply_markup=action_kb, disable_web_page_preview=True
                     )
