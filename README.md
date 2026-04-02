@@ -49,3 +49,42 @@ If you send a plain message like “What can you do?” the bot will reply with 
 
 - Media processing is limited to metadata + captions (no OCR/transcription).
 - Daily summaries are generated per chat where new messages were received during the last 24 hours.
+
+## Deploy to server (universal script)
+
+Added script: `scripts/deploy.sh`
+
+What it does:
+- Syncs current project to server via `rsync` (excluding `.git`, `.venv`, local `.env`).
+- Creates/updates `.venv` on server.
+- Installs `requirements.txt`.
+- Restarts bot with your command.
+
+One-time local setup:
+```bash
+chmod +x scripts/deploy.sh
+```
+
+Example deploy:
+```bash
+scripts/deploy.sh \
+  --host ubuntu@203.0.113.10 \
+  --path /opt/telegram-context-bot \
+  --restart "systemctl restart telegram-context-bot"
+```
+
+If your service has another name, just change `--restart`.
+
+### SSH-only update (no rsync)
+
+If code is already on server and you want simple updates via SSH:
+
+```bash
+chmod +x scripts/update-via-ssh.sh
+scripts/update-via-ssh.sh --host root@88.218.122.81
+```
+
+This command runs on server:
+- `git fetch` + `git pull --ff-only`
+- installs `requirements.txt` into `.venv`
+- `systemctl restart telegram-context-bot`

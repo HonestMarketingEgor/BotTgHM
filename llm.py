@@ -58,6 +58,8 @@ Messages:
         mode: str,
         question: str,
         context_messages: Sequence[str] | None = None,
+        source_chat_title: str | None = None,
+        memory_scope: str | None = None,
     ) -> LLMResult:
         if mode == "help_mode":
             system = HELP_SYSTEM
@@ -67,6 +69,10 @@ Messages:
             system = ASSISTANT_SYSTEM
 
         prompt = f"Question:\n{question.strip()}\n"
+        if source_chat_title:
+            prompt += f"\nSource chat title: {source_chat_title}\n"
+        if memory_scope:
+            prompt += f"Memory scope: {memory_scope}\n"
         if context_messages:
             prompt += "\nContext:\n" + "\n".join(context_messages)
 

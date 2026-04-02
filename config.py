@@ -56,6 +56,10 @@ class Config:
     enable_auto_response_mode: bool
     default_mode: str
     enable_chat_analysis: bool
+    retention_days: int
+    retention_cleanup_hours: int
+    fuzzy_chat_min_score: float
+    fuzzy_chat_max_candidates: int
 
 
 def load_config() -> Config:
@@ -115,5 +119,9 @@ def load_config() -> Config:
         enable_auto_response_mode=_env_bool("ENABLE_AUTO_RESPONSE_MODE", True),
         default_mode=_clean_env_value(os.getenv("DEFAULT_MODE", "assistant_mode")),
         enable_chat_analysis=_env_bool("ENABLE_CHAT_ANALYSIS", True),
+        retention_days=_env_int("RETENTION_DAYS", 180),
+        retention_cleanup_hours=_env_int("RETENTION_CLEANUP_HOURS", 24),
+        fuzzy_chat_min_score=float(os.getenv("FUZZY_CHAT_MIN_SCORE", "0.58").strip() or "0.58"),
+        fuzzy_chat_max_candidates=_env_int("FUZZY_CHAT_MAX_CANDIDATES", 5),
     )
 

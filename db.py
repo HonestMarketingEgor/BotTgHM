@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from typing import Any
 
@@ -112,6 +113,35 @@ CREATE TABLE IF NOT EXISTS chat_active_project (
 );
 """
 
+CREATE_CHAT_REGISTRY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS chat_registry (
+  chat_id INTEGER PRIMARY KEY,
+  chat_title TEXT NOT NULL,
+  chat_type TEXT NOT NULL,
+  updated_at_ts INTEGER NOT NULL
+);
+"""
+
+CREATE_CHAT_MEMBERS_SEEN_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS chat_members_seen (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  last_seen_ts INTEGER NOT NULL,
+  UNIQUE(chat_id, user_id)
+);
+"""
+
+CREATE_LONG_TERM_FACTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS long_term_facts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  fact_kind TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at_ts INTEGER NOT NULL
+);
+"""
+
 
 class Database:
     def __init__(self, path: str) -> None:
@@ -132,6 +162,9 @@ class Database:
             + CREATE_PROJECTS_TABLE_SQL
             + CREATE_PROJECT_MEMORY_TABLE_SQL
             + CREATE_CHAT_ACTIVE_PROJECT_TABLE_SQL
+            + CREATE_CHAT_REGISTRY_TABLE_SQL
+            + CREATE_CHAT_MEMBERS_SEEN_TABLE_SQL
+            + CREATE_LONG_TERM_FACTS_TABLE_SQL
         )
         await self._conn.commit()
 
@@ -639,5 +672,189 @@ class Database:
         out: dict[str, str] = {}
         for row in rows:
             out[str(row["section"])] = str(row["content"])
+        return out
+
+    async def upsert_chat_registry(
+        self, *, chat_id: int, chat_title: str, chat_type: str
+    ) -> None:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+        await self._conn.execute(
+            """
+            INSERT OR REPLACE INTO chat_registry (chat_id, chat_title, chat_type, updated_at_ts)
+            VALUES (?, ?, ?, ?)
+            """,
+            (chat_id, chat_title, chat_type, int(time.time())),
+        )
+        await self._conn.commit()
+
+    async def get_chat_registry_entry(self, *, chat_id: int) -> tuple[int, str, str] | None:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+        cur = await self._conn.execute(
+            """
+            SELECT chat_id, chat_title, chat_type
+            FROM chat_registry
+            WHERE chat_id = ?
+            LIMIT 1
+            """,
+            (chat_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return int(row["chat_id"]), str(row["chat_title"]), str(row["chat_type"])
+
+    async def mark_chat_member_seen(self, *, chat_id: int, user_id: int) -> None:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+        await self._conn.execute(
+            """
+            INSERT OR REPLACE INTO chat_members_seen (chat_id, user_id, last_seen_ts)
+            VALUES (?, ?, ?)
+            """,
+            (chat_id, user_id, int(time.time())),
+        )
+        await self._conn.commit()
+
+    async def has_user_seen_chat(self, *, chat_id: int, user_id: int) -> bool:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+        cur = await self._conn.execute(
+            """
+            SELECT id
+            FROM chat_members_seen
+            WHERE chat_id = ? AND user_id = ?
+            LIMIT 1
+            """,
+            (chat_id, user_id),
+        )
+        row = await cur.fetchone()
+        return row is not None
+
+    async def has_cross_chat_access(
+        self, *, user_id: int, current_chat_id: int, target_chat_id: int
+    ) -> bool:
+        left = await self.has_user_seen_chat(chat_id=current_chat_id, user_id=user_id)
+        if not left:
+            return False
+        right = await self.has_user_seen_chat(chat_id=target_chat_id, user_id=user_id)
+        return right
+
+    async def find_chat_by_title_fuzzy(
+        self,
+        *,
+        title_query: str,
+        min_score: float,
+        max_candidates: int,
+    ) -> tuple[int, str, float] | None:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+        cur = await self._conn.execute(
+            """
+            SELECT chat_id, chat_title
+            FROM chat_registry
+            ORDER BY updated_at_ts DESC
+            LIMIT 500
+            """
+        )
+        rows = await cur.fetchall()
+        q = (title_query or "").strip().lower()
+        if not q:
+            return None
+
+        scored: list[tuple[int, str, float]] = []
+        for row in rows:
+            chat_id = int(row["chat_id"])
+            title = str(row["chat_title"])
+            title_l = title.lower()
+            ratio = SequenceMatcher(None, q, title_l).ratio()
+            if q in title_l:
+                ratio = max(ratio, 0.95)
+            if ratio >= min_score:
+                scored.append((chat_id, title, ratio))
+
+        if not scored:
+            return None
+        scored.sort(key=lambda x: x[2], reverse=True)
+        return scored[: max(1, max_candidates)][0]
+
+    async def cleanup_old_messages(self, *, older_than_ts: int) -> int:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+        cur = await self._conn.execute(
+            """
+            DELETE FROM messages
+            WHERE created_at_ts < ?
+            """,
+            (older_than_ts,),
+        )
+        await self._conn.commit()
+        return int(cur.rowcount or 0)
+
+    async def has_messages_older_than(self, *, chat_id: int, older_than_ts: int) -> bool:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+        cur = await self._conn.execute(
+            """
+            SELECT id
+            FROM messages
+            WHERE chat_id = ?
+              AND created_at_ts < ?
+            LIMIT 1
+            """,
+            (chat_id, older_than_ts),
+        )
+        row = await cur.fetchone()
+        return row is not None
+
+    async def get_messages_for_chat_topic(
+        self,
+        *,
+        chat_id: int,
+        topic_query: str,
+        min_ts: int,
+        limit: int,
+    ) -> list[StoredMessage]:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+        topic = (topic_query or "").strip().lower()
+        if not topic:
+            return await self.get_recent_messages_for_chat(chat_id=chat_id, min_ts=min_ts, limit=limit)
+
+        pattern = f"%{topic}%"
+        cur = await self._conn.execute(
+            """
+            SELECT chat_id, message_id, from_user_id, from_username, created_at_ts,
+                   text, caption, media_json
+            FROM messages
+            WHERE chat_id = ?
+              AND created_at_ts >= ?
+              AND (
+                LOWER(COALESCE(text, '')) LIKE ?
+                OR LOWER(COALESCE(caption, '')) LIKE ?
+              )
+            ORDER BY created_at_ts DESC
+            LIMIT ?
+            """,
+            (chat_id, min_ts, pattern, pattern, limit),
+        )
+        rows = await cur.fetchall()
+        out: list[StoredMessage] = []
+        for r in rows:
+            media_json = r["media_json"]
+            media = json.loads(media_json) if media_json else None
+            out.append(
+                StoredMessage(
+                    chat_id=int(r["chat_id"]),
+                    message_id=int(r["message_id"]),
+                    from_user_id=int(r["from_user_id"]),
+                    from_username=r["from_username"],
+                    created_at_ts=int(r["created_at_ts"]),
+                    text=r["text"],
+                    caption=r["caption"],
+                    media=media,
+                )
+            )
         return out
 
