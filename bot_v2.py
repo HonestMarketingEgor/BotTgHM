@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import re
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
@@ -147,9 +148,8 @@ async def main() -> None:
     def strip_bot_mention(text: str) -> str:
         if not bot_username:
             return text.strip()
-        return text.replace(f"@{bot_username}", "").replace(
-            f"@{bot_username.capitalize()}", ""
-        ).strip()
+        pattern = rf"@{re.escape(bot_username)}\b"
+        return re.sub(pattern, "", text or "", flags=re.IGNORECASE).strip()
 
     async def answer_user_query(
         *,
@@ -266,7 +266,7 @@ async def main() -> None:
         await answer_user_query(message=message, question=q, forced_mode=ANALYSIS_MODE)
 
     @router.message()
-    async def store_incoming(message: Message) -> None:
+    async def on_text(message: Message) -> None:
         if message.chat is None or message.from_user is None:
             return
         if message.from_user.id == bot_id:
@@ -277,35 +277,24 @@ async def main() -> None:
         text = message.text or None
         caption = getattr(message, "caption", None) or None
         media = extract_media_metadata(message)
-        if not (text or caption or media):
-            return
-
-        stored = StoredMessage(
-            chat_id=message.chat.id,
-            message_id=message.message_id,
-            from_user_id=message.from_user.id,
-            from_username=message.from_user.username,
-            created_at_ts=int(message.date.timestamp()),
-            text=text,
-            caption=caption,
-            media=media,
-        )
-        await db.insert_message(stored)
-
-    @router.message()
-    async def on_text(message: Message) -> None:
-        if message.chat is None or message.from_user is None:
-            return
-        if message.from_user.id == bot_id:
-            return
-        if message.text and message.text.strip().startswith("/"):
-            return
+        if text or caption or media:
+            stored = StoredMessage(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                from_user_id=message.from_user.id,
+                from_username=message.from_user.username,
+                created_at_ts=int(message.date.timestamp()),
+                text=text,
+                caption=caption,
+                media=media,
+            )
+            await db.insert_message(stored)
 
         is_group = message.chat.type in {"group", "supergroup"}
         if is_group and not is_bot_mentioned(message):
             return
 
-        raw = message.text or message.caption or ""
+        raw = text or caption or ""
         q = strip_bot_mention(raw) if is_group else raw.strip()
         if not q:
             return
