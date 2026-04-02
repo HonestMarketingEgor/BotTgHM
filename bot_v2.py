@@ -68,6 +68,18 @@ def _is_analysis_intent(text: str) -> bool:
     return any(m in q for m in markers)
 
 
+def _is_current_chat_name_intent(text: str) -> bool:
+    q = (text or "").strip().lower().replace("ё", "е")
+    patterns = [
+        "как называется этот чат",
+        "название этого чата",
+        "назови этот чат",
+        "какое название чата",
+        "что это за чат",
+    ]
+    return any(p in q for p in patterns)
+
+
 def _parse_cross_chat_intent(text: str) -> tuple[str, str] | None:
     q = (text or "").strip()
     low = q.lower()
@@ -299,6 +311,18 @@ async def main() -> None:
 
         if _is_help_intent(q):
             await message.reply(build_help_redirect(bot_username))
+            return
+
+        if _is_current_chat_name_intent(q):
+            chat_title = (
+                (message.chat.title or "").strip()
+                or (message.chat.full_name or "").strip()
+                or str(message.chat.id)
+            )
+            await message.reply(
+                f"Текущий чат называется: «{chat_title}».\n"
+                f"chat_id: {message.chat.id}"
+            )
             return
 
         cross_chat_req = _parse_cross_chat_intent(q)
