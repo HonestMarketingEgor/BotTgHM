@@ -519,3 +519,63 @@ def build_tasks_answer(question: str, context_messages: Sequence[str]) -> str:
 
     return "\n".join(tasks[:7])
 
+
+def build_help_text(bot_username: str | None = None) -> str:
+    mention_hint = f"@{bot_username}" if bot_username else "@bot"
+    return "\n".join(
+        [
+            "Я ИИ-помощник: универсальный ассистент + аналитик для рекламного агентства.",
+            "",
+            "Как задать вопрос:",
+            f"— в групповом чате: напиши {mention_hint} и вопрос",
+            "— в группе команды работают без @упоминания: /help, /ask, /mode, /reset",
+            "— формат: /ask <вопрос> или @bot <вопрос>",
+            "",
+            "Что умею (универсально):",
+            "— объяснить, как пользоваться ботом и с чего начать",
+            "— структурировать запрос и предложить план действий",
+            "— дать короткий ответ на бытовые и рабочие вопросы",
+            "",
+            "Что умею для агентства:",
+            "— анализировать сообщения чата по явному запросу",
+            "— предлагать варианты действий и гипотезы",
+            "— подсвечивать, каких данных не хватает для решения",
+            "",
+            "Режимы:",
+            "— /mode assistant  (универсальный помощник)",
+            "— /mode analysis   (анализ по чату)",
+            "— /reset           (сброс к режиму по умолчанию)",
+        ]
+    )
+
+
+def build_help_redirect(bot_username: str | None = None) -> str:
+    mention_hint = f"@{bot_username}" if bot_username else "@bot"
+    return "\n".join(
+        [
+            "Этот запрос про возможности бота.",
+            "Чтобы получить полную инструкцию, используй /help.",
+            f"Коротко: в группе напиши {mention_hint} и вопрос, например:",
+            f"— {mention_hint} проанализируй KPI и предложи план на неделю",
+        ]
+    )
+
+
+def build_assistant_fallback(question: str) -> str:
+    return "\n".join(
+        [
+            "Сейчас отвечу как помощник в коротком формате.",
+            f"Запрос: {question[:180]}",
+            "Если нужен анализ переписки, используй /mode analysis или начни с «проанализируй ...».",
+        ]
+    )
+
+
+def build_analysis_fallback(question: str, context_messages: Sequence[str]) -> str:
+    if not context_messages:
+        return (
+            "Для анализа не хватает контекста из чата. "
+            "Сформулируй задачу точнее или добавь данные в чат."
+        )
+    return build_freeform_answer(question, context_messages)
+

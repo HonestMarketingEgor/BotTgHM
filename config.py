@@ -54,6 +54,8 @@ class Config:
     max_links: int
     max_project_memory_chars: int
     enable_auto_response_mode: bool
+    default_mode: str
+    enable_chat_analysis: bool
 
 
 def load_config() -> Config:
@@ -111,5 +113,7 @@ def load_config() -> Config:
         max_links=_env_int("MAX_LINKS", 3),
         max_project_memory_chars=_env_int("MAX_PROJECT_MEMORY_CHARS", 1800),
         enable_auto_response_mode=_env_bool("ENABLE_AUTO_RESPONSE_MODE", True),
+        default_mode=_clean_env_value(os.getenv("DEFAULT_MODE", "assistant_mode")),
+        enable_chat_analysis=_env_bool("ENABLE_CHAT_ANALYSIS", True),
     )
 

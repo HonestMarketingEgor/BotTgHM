@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import asyncio as _bootstrap_asyncio
+from bot_v2 import main as _bot_v2_main
+
+if __name__ == "__main__":
+    _bootstrap_asyncio.run(_bot_v2_main())
+    raise SystemExit(0)
+
 import asyncio
 import json
 import re
@@ -29,6 +36,8 @@ from formatter import (
     build_tasks_answer,
     build_fallback_answer,
     build_freeform_answer,
+    build_help_text,
+    build_help_redirect,
 )
 from links import extract_urls, fetch_url_text, fetch_google_drive_folder_image_urls
 import httpx
@@ -42,6 +51,8 @@ _PROJECT_SECTIONS_ORDER = ["brief", "kpi", "constraints", "audience", "hypothese
 
 _DEBUG_LOG_PATH = "/Users/pelemenio/telegram-context-bot/.cursor/debug-283857.log"
 _DEBUG_SESSION_ID = "283857"
+_AGENT_DEBUG_LOG_PATH = "/Users/pelemenio/telegram-context-bot/.cursor/debug-aff1f6.log"
+_AGENT_DEBUG_SESSION_ID = "aff1f6"
 
 
 def _debug_log(
@@ -68,6 +79,30 @@ def _debug_log(
     except Exception:
         pass
     # #endregion
+
+
+def _agent_diag(
+    *,
+    run_id: str,
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict | None = None,
+) -> None:
+    payload = {
+        "sessionId": _AGENT_DEBUG_SESSION_ID,
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data or {},
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open(_AGENT_DEBUG_LOG_PATH, "a") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
 
 
 def _is_maxon_joke_request(text: str) -> bool:
@@ -164,6 +199,26 @@ def _response_mode_label(mode: str) -> str:
     return "structured_marketing (ситуация -> гипотезы -> шаг)"
 
 
+def _is_help_intent(question: str) -> bool:
+    q = (question or "").strip().lower().replace("ё", "е")
+    q = " ".join(q.split())
+    if not q:
+        return False
+    help_markers = [
+        "что ты умеешь",
+        "что умеет бот",
+        "что умеешь",
+        "как пользоваться",
+        "как тебя использовать",
+        "какие функции",
+        "какой функционал",
+        "help",
+        "start",
+        "инструкция",
+    ]
+    return any(m in q for m in help_markers)
+
+
 async def main() -> None:
     cfg = load_config()
 
@@ -217,6 +272,15 @@ async def main() -> None:
     me = await bot.get_me()
     bot_id = me.id
     bot_username = (me.username or "").strip().lower()
+    # #region agent log
+    _agent_diag(
+        run_id=f"boot-{int(time.time())}",
+        hypothesis_id="H4",
+        location="bot.py:main_after_get_me",
+        message="bot runtime started",
+        data={"bot_id": bot_id, "bot_username": bot_username},
+    )
+    # #endregion
 
     def is_bot_mentioned(message: Message) -> bool:
         if not bot_username:
@@ -235,6 +299,38 @@ async def main() -> None:
 
         return _re.sub(rf"@{_re.escape(bot_username)}\b", "", text, flags=_re.I).strip()
 
+    @router.message(Command("start"))
+    async def start_cmd(message: Message) -> None:
+        # #region agent log
+        _agent_diag(
+            run_id=f"msg-{message.chat.id}-{message.message_id}",
+            hypothesis_id="H1",
+            location="bot.py:start_cmd",
+            message="start command handler invoked",
+            data={
+                "chat_id": message.chat.id if message.chat else None,
+                "raw_text": message.text or "",
+            },
+        )
+        # #endregion
+        await message.reply(build_help_text(bot_username))
+
+    @router.message(Command("help"))
+    async def help_cmd(message: Message) -> None:
+        # #region agent log
+        _agent_diag(
+            run_id=f"msg-{message.chat.id}-{message.message_id}",
+            hypothesis_id="H1",
+            location="bot.py:help_cmd",
+            message="help command handler invoked",
+            data={
+                "chat_id": message.chat.id if message.chat else None,
+                "raw_text": message.text or "",
+            },
+        )
+        # #endregion
+        await message.reply(build_help_text(bot_username))
+
     async def answer_question(message: Message, question: str) -> None:
         question = (question or "").strip()
         debug_run_id = (
@@ -251,6 +347,7 @@ async def main() -> None:
                 "from_user_id": message.from_user.id if message.from_user else None,
                 "question_len": len(question),
                 "is_bot_alive_ping": _is_bot_alive_ping(question),
+                "is_help_intent": _is_help_intent(question),
                 "has_text": bool(message.text),
                 "has_caption": bool(getattr(message, "caption", None)),
             },
@@ -278,6 +375,19 @@ async def main() -> None:
                 "Да, я на связи. Если «умные» ответы не приходят — проверь `OPENAI_API_KEY` "
                 "и биллинг на https://platform.openai.com (логи процесса бота покажут точную ошибку)."
             )
+            return
+
+        if _is_help_intent(question):
+            # #region agent log
+            _agent_diag(
+                run_id=f"msg-{message.chat.id}-{message.message_id}",
+                hypothesis_id="H3",
+                location="bot.py:answer_question_help_guard",
+                message="help intent guard matched",
+                data={"question": question[:200]},
+            )
+            # #endregion
+            await message.reply(build_help_redirect(bot_username))
             return
 
         def _sanitize_llm_answer(candidate: str) -> str:
@@ -809,6 +919,10 @@ async def main() -> None:
             else:
                 return
 
+        if _is_help_intent(question):
+            await message.answer(build_help_redirect(bot_username), disable_web_page_preview=True)
+            return
+
         # Use session context; do not re-rank other chat messages.
         selected_lines = session[1]
         effective_question = question
@@ -1138,6 +1252,15 @@ async def main() -> None:
 
         # Avoid storing bot commands themselves.
         if message.text and message.text.strip().startswith("/"):
+            # #region agent log
+            _agent_diag(
+                run_id=f"msg-{message.chat.id}-{message.message_id}",
+                hypothesis_id="H1",
+                location="bot.py:store_incoming_command_ignored",
+                message="command message reached generic handler and ignored for storage",
+                data={"raw_text": message.text.strip()},
+            )
+            # #endregion
             return
 
         text = message.text or None
@@ -1184,7 +1307,28 @@ async def main() -> None:
         if message.chat is None:
             return
         # Require @mention as well for /ask.
+        # #region agent log
+        _agent_diag(
+            run_id=f"msg-{message.chat.id}-{message.message_id}",
+            hypothesis_id="H2",
+            location="bot.py:ask_handler_entry",
+            message="ask command handler invoked",
+            data={
+                "raw_text": message.text or "",
+                "is_mentioned": is_bot_mentioned(message),
+            },
+        )
+        # #endregion
         if not is_bot_mentioned(message):
+            # #region agent log
+            _agent_diag(
+                run_id=f"msg-{message.chat.id}-{message.message_id}",
+                hypothesis_id="H2",
+                location="bot.py:ask_handler_reject_no_mention",
+                message="ask rejected because bot mention missing",
+                data={"raw_text": message.text or ""},
+            )
+            # #endregion
             return
 
         raw = (message.text or "").strip()
