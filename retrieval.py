@@ -121,3 +121,56 @@ def budgeted_join(lines: Iterable[str], *, max_chars: int) -> str:
         total += extra
     return "\n".join(out)
 
+
+def build_project_memory_lines(memory: dict[str, str]) -> list[str]:
+    preferred_order = [
+        "brief",
+        "kpi",
+        "constraints",
+        "audience",
+        "hypotheses",
+        "notes",
+    ]
+    out: list[str] = []
+    used: set[str] = set()
+    for section in preferred_order:
+        content = (memory.get(section) or "").strip()
+        if content:
+            out.append(f"[PROJECT:{section}] {content}")
+            used.add(section)
+    for section, content in memory.items():
+        if section in used:
+            continue
+        c = (content or "").strip()
+        if c:
+            out.append(f"[PROJECT:{section}] {c}")
+    return out
+
+
+def prepend_project_context(
+    *,
+    project_lines: Sequence[str],
+    context_lines: Sequence[str],
+    max_chars: int,
+) -> list[str]:
+    out: list[str] = []
+    total = 0
+    for line in project_lines:
+        if not line:
+            continue
+        extra = len(line) + 1
+        if total + extra > max_chars:
+            break
+        out.append(line)
+        total += extra
+
+    for line in context_lines:
+        if not line:
+            continue
+        extra = len(line) + 1
+        if total + extra > max_chars:
+            break
+        out.append(line)
+        total += extra
+    return out
+

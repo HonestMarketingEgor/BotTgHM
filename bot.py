@@ -14,9 +14,15 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from config import load_config
 from daily_loop import DailyRunParams, daily_summary_loop
 from db import Database, StoredMessage
-from llm import LLMClient
+from llm import LLMClient, classify_response_mode
 from message_extract import extract_media_metadata
-from retrieval import message_to_excerpt, rank_messages
+from retrieval import (
+    budgeted_join,
+    build_project_memory_lines,
+    message_to_excerpt,
+    prepend_project_context,
+    rank_messages,
+)
 from formatter import (
     build_numbers_answer,
     build_marketing_suggestions_fallback,
@@ -31,9 +37,11 @@ from table_kpis import build_numbers_from_link_context
 _MAXON_JOKE_REPLY = (
     "Медведь увидел в лесу горящую машину, сел в неё — и тоже сгорел."
 )
+_PROJECT_SECTIONS = {"brief", "kpi", "constraints", "audience", "hypotheses", "notes"}
+_PROJECT_SECTIONS_ORDER = ["brief", "kpi", "constraints", "audience", "hypotheses", "notes"]
 
-_DEBUG_LOG_PATH = "/Users/pelemenio/telegram-context-bot/.cursor/debug-d35d78.log"
-_DEBUG_SESSION_ID = "d35d78"
+_DEBUG_LOG_PATH = "/Users/pelemenio/telegram-context-bot/.cursor/debug-283857.log"
+_DEBUG_SESSION_ID = "283857"
 
 
 def _debug_log(
@@ -132,6 +140,30 @@ def _openai_failure_reply(exc: BaseException) -> str | None:
     return None
 
 
+def _slugify_project_name(name: str) -> str:
+    base = re.sub(r"[^a-zA-Z0-9а-яА-ЯёЁ_-]+", "-", (name or "").strip().lower())
+    base = base.strip("-_")
+    return base or "project"
+
+
+def _parse_command_args(text: str | None) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    parts = raw.split(maxsplit=1)
+    if len(parts) < 2:
+        return ""
+    return parts[1].strip()
+
+
+def _response_mode_label(mode: str) -> str:
+    if mode == "data_first":
+        return "data_first (факты -> вывод)"
+    if mode == "short_exec":
+        return "short_exec (кратко для руководителя)"
+    return "structured_marketing (ситуация -> гипотезы -> шаг)"
+
+
 async def main() -> None:
     cfg = load_config()
 
@@ -179,6 +211,7 @@ async def main() -> None:
             api_key=cfg.openai_api_key,
             model=cfg.openai_model,
             suggestions_model=cfg.openai_model_suggestions,
+            base_url=cfg.openai_base_url or None,
         )
 
     me = await bot.get_me()
@@ -296,6 +329,19 @@ async def main() -> None:
             recent_msgs = await db.get_recent_messages_for_chat(
                 chat_id=message.chat.id, min_ts=min_ts, limit=300
             )
+            active_project = await db.get_active_project(chat_id=message.chat.id)
+            project_memory: dict[str, str] = {}
+            project_lines: list[str] = []
+            project_context_text: str | None = None
+            if active_project is not None:
+                project_memory = await db.get_project_memory(
+                    chat_id=message.chat.id, project_id=active_project.id
+                )
+                project_lines = build_project_memory_lines(project_memory)
+                if project_lines:
+                    project_context_text = budgeted_join(
+                        project_lines, max_chars=cfg.max_project_memory_chars
+                    )
 
             # По умолчанию: если пользователь прислал ссылку, анализируем ТОЛЬКО содержимое ссылок.
             # Если он явно просит учесть “много инфы/весь чат/включая сообщения”, включаем контекст чата.
@@ -431,6 +477,13 @@ async def main() -> None:
                 if approx_total + len(current_photo_marker) <= cfg.max_context_chars:
                     selected_lines.append(current_photo_marker)
 
+            if project_lines:
+                selected_lines = prepend_project_context(
+                    project_lines=project_lines,
+                    context_lines=selected_lines,
+                    max_chars=cfg.max_context_chars,
+                )
+
             # Convert Telegram photo file_ids to base64 data URLs (for vision).
             telegram_image_data_urls: list[str] = []
             if telegram_photo_file_ids:
@@ -459,6 +512,14 @@ async def main() -> None:
 
             # Important: update session question without URL noise.
             effective_question = question_no_urls
+            if cfg.enable_auto_response_mode:
+                if llm is not None:
+                    response_mode = llm.classify_response_mode(question=effective_question)
+                else:
+                    response_mode = classify_response_mode(effective_question)
+            else:
+                response_mode = "structured_marketing"
+            mode_prefix = f"Режим ответа: {_response_mode_label(response_mode)}\n\n"
 
             # If we have extracted images (Drive and/or Telegram), prefer multimodal analysis.
             has_images = (len(drive_image_data_urls) + len(telegram_image_data_urls)) > 0
@@ -513,7 +574,19 @@ async def main() -> None:
                 latest_summary_text = latest[0] if latest else None
 
             if llm is None:
-                out = build_freeform_answer(effective_question, selected_lines)
+                # #region agent log
+                _debug_log(
+                    run_id=debug_run_id,
+                    hypothesis_id="H4_llm_unavailable",
+                    location="bot.py:llm_is_none_fallback",
+                    message="llm is unavailable, using local fallback",
+                    data={
+                        "selected_lines_count": len(selected_lines),
+                        "question_len": len(effective_question),
+                    },
+                )
+                # #endregion
+                out = mode_prefix + build_freeform_answer(effective_question, selected_lines)
                 sent = await message.answer(
                     out, reply_markup=action_kb, disable_web_page_preview=True
                 )
@@ -526,12 +599,29 @@ async def main() -> None:
 
             try:
                 phase = "llm_call"
+                llm_call_started_ms = int(time.time() * 1000)
+                # #region agent log
+                _debug_log(
+                    run_id=debug_run_id,
+                    hypothesis_id="H2_llm_latency_or_hang",
+                    location="bot.py:before_llm_call",
+                    message="starting llm request",
+                    data={
+                        "has_images": has_images,
+                        "selected_lines_count": len(selected_lines),
+                        "question_len": len(effective_question),
+                    },
+                )
+                # #endregion
                 if has_images:
                     answer = await llm.answer_question_with_images(
+                        chat_id=message.chat.id,
                         question=effective_question,
                         latest_daily_summary=latest_summary_text,
                         context_messages=selected_lines,
                         image_urls=(drive_image_data_urls + telegram_image_data_urls),
+                        project_context=project_context_text,
+                        response_mode=response_mode,
                     )
                 else:
                     answer = await llm.answer_question(
@@ -539,7 +629,21 @@ async def main() -> None:
                         question=effective_question,
                         latest_daily_summary=latest_summary_text,
                         context_messages=selected_lines,
+                        project_context=project_context_text,
+                        response_mode=response_mode,
                     )
+                # #region agent log
+                _debug_log(
+                    run_id=debug_run_id,
+                    hypothesis_id="H2_llm_latency_or_hang",
+                    location="bot.py:after_llm_call",
+                    message="llm request finished",
+                    data={
+                        "duration_ms": int(time.time() * 1000) - llm_call_started_ms,
+                        "answer_len": len((answer.text or "").strip()),
+                    },
+                )
+                # #endregion
             except Exception as e:
                 err_low = str(e).lower()
                 print(f"[answer_question] OpenAI error: {type(e).__name__}: {e}", flush=True)
@@ -570,7 +674,9 @@ async def main() -> None:
                         "[answer_question] fallback_rule_based: llm region/quota restriction",
                         flush=True,
                     )
-                    out = build_freeform_answer(effective_question, selected_lines)
+                    out = mode_prefix + build_freeform_answer(
+                        effective_question, selected_lines
+                    )
                     sent = await message.answer(
                         out, reply_markup=action_kb, disable_web_page_preview=True
                     )
@@ -584,7 +690,9 @@ async def main() -> None:
                 if hint:
                     print("[answer_question] hint_reply_to_user: openai_failure_reply", flush=True)
                     sent = await message.answer(
-                        hint, reply_markup=action_kb, disable_web_page_preview=True
+                        mode_prefix + hint,
+                        reply_markup=action_kb,
+                        disable_web_page_preview=True,
                     )
                     await db.map_bot_message_to_session(
                         chat_id=message.chat.id,
@@ -594,7 +702,22 @@ async def main() -> None:
                     return
                 raise
 
+            used_mode = answer.response_mode or response_mode
             out = _sanitize_llm_answer((answer.text or "").strip())
+            out = f"Режим ответа: {_response_mode_label(used_mode)}\n\n{out}"
+            # #region agent log
+            _debug_log(
+                run_id=debug_run_id,
+                hypothesis_id="H3_sanitize_forced_fallback",
+                location="bot.py:after_sanitize_llm_answer",
+                message="llm answer sanitized",
+                data={
+                    "raw_answer_len": len((answer.text or "").strip()),
+                    "final_answer_len": len(out),
+                    "used_fallback": out != (answer.text or "").strip(),
+                },
+            )
+            # #endregion
 
             if len(out) > 3200:
                 out = out[:3190] + "\n…"
@@ -689,6 +812,22 @@ async def main() -> None:
         # Use session context; do not re-rank other chat messages.
         selected_lines = session[1]
         effective_question = question
+        active_project = await db.get_active_project(chat_id=message.chat.id)
+        project_context_text: str | None = None
+        if active_project is not None:
+            project_memory = await db.get_project_memory(
+                chat_id=message.chat.id, project_id=active_project.id
+            )
+            project_lines = build_project_memory_lines(project_memory)
+            if project_lines:
+                project_context_text = budgeted_join(
+                    project_lines, max_chars=cfg.max_project_memory_chars
+                )
+                selected_lines = prepend_project_context(
+                    project_lines=project_lines,
+                    context_lines=selected_lines,
+                    max_chars=cfg.max_context_chars,
+                )
 
         # Optional: if reply includes URLs, fetch and append.
         urls = extract_urls(question)
@@ -724,7 +863,15 @@ async def main() -> None:
             latest_summary_text = latest[0] if latest else None
 
         if llm is None:
-            out = build_freeform_answer(effective_question, selected_lines)
+            response_mode = (
+                classify_response_mode(effective_question)
+                if cfg.enable_auto_response_mode
+                else "structured_marketing"
+            )
+            out = (
+                f"Режим ответа: {_response_mode_label(response_mode)}\n\n"
+                + build_freeform_answer(effective_question, selected_lines)
+            )
             await message.answer(out, disable_web_page_preview=True)
             return
 
@@ -738,6 +885,11 @@ async def main() -> None:
 
         typing_task = asyncio.create_task(_typing_loop())
         try:
+            response_mode = (
+                llm.classify_response_mode(question=effective_question)
+                if cfg.enable_auto_response_mode
+                else "structured_marketing"
+            )
             # If this reply includes a Telegram photo, analyze it with vision.
             reply_media = extract_media_metadata(message)
             image_urls: list[str] = []
@@ -768,6 +920,8 @@ async def main() -> None:
                     latest_daily_summary=latest_summary_text,
                     context_messages=selected_lines,
                     image_urls=image_urls[:1],
+                    project_context=project_context_text,
+                    response_mode=response_mode,
                 )
             else:
                 answer = await llm.answer_question(
@@ -775,6 +929,8 @@ async def main() -> None:
                     question=effective_question,
                     latest_daily_summary=latest_summary_text,
                     context_messages=selected_lines,
+                    project_context=project_context_text,
+                    response_mode=response_mode,
                 )
             candidate = (answer.text or "").strip()
             # Local format sanity check; fallback if it looks unsafe.
@@ -783,17 +939,193 @@ async def main() -> None:
                 out = build_freeform_answer(effective_question, selected_lines)
             else:
                 out = candidate
+            used_mode = answer.response_mode or response_mode
+            out = f"Режим ответа: {_response_mode_label(used_mode)}\n\n{out}"
             if len(out) > 3200:
                 out = out[:3190] + "\n…"
             await message.answer(out, disable_web_page_preview=True)
         except Exception:
-            out = build_freeform_answer(effective_question, selected_lines)
+            response_mode = (
+                classify_response_mode(effective_question)
+                if cfg.enable_auto_response_mode
+                else "structured_marketing"
+            )
+            out = (
+                f"Режим ответа: {_response_mode_label(response_mode)}\n\n"
+                + build_freeform_answer(effective_question, selected_lines)
+            )
             await message.answer(out, disable_web_page_preview=True)
         finally:
             try:
                 typing_task.cancel()
             except Exception:
                 pass
+
+    @router.message(Command("project_new"))
+    async def project_new(message: Message) -> None:
+        if message.chat is None:
+            return
+        args = _parse_command_args(message.text)
+        if not args:
+            await message.reply(
+                "Формат: /project_new <название проекта>\n"
+                "Пример: /project_new Контекст РСЯ Q2"
+            )
+            return
+        project_name = args.strip()
+        if len(project_name) > 80:
+            await message.reply("Название слишком длинное. Лимит: 80 символов.")
+            return
+
+        base_slug = _slugify_project_name(project_name)
+        slug = base_slug
+        suffix = 2
+        while True:
+            existing = await db.get_project_by_ref(chat_id=message.chat.id, project_ref=slug)
+            if existing is None:
+                break
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+
+        project_id = await db.create_project(chat_id=message.chat.id, slug=slug, name=project_name)
+        await db.set_active_project(chat_id=message.chat.id, project_id=project_id)
+        await message.reply(
+            f"Проект создан и выбран активным.\n"
+            f"id: {project_id}\nslug: {slug}\nname: {project_name}"
+        )
+
+    @router.message(Command("project_list"))
+    async def project_list(message: Message) -> None:
+        if message.chat is None:
+            return
+        projects = await db.list_projects(chat_id=message.chat.id)
+        if not projects:
+            await message.reply(
+                "Пока нет проектов. Создай первый:\n/project_new <название проекта>"
+            )
+            return
+        active_project = await db.get_active_project(chat_id=message.chat.id)
+        lines = ["Проекты в этом чате:"]
+        for p in projects:
+            marker = " (active)" if active_project and active_project.id == p.id else ""
+            lines.append(f"— {p.id} | {p.slug} | {p.name}{marker}")
+        await message.reply("\n".join(lines))
+
+    @router.message(Command("project_use"))
+    async def project_use(message: Message) -> None:
+        if message.chat is None:
+            return
+        ref = _parse_command_args(message.text)
+        if not ref:
+            await message.reply(
+                "Формат: /project_use <id|slug>\n"
+                "Пример: /project_use 3\nили /project_use context-rsya-q2"
+            )
+            return
+        project = await db.get_project_by_ref(chat_id=message.chat.id, project_ref=ref)
+        if project is None:
+            await message.reply("Проект не найден в этом чате.")
+            return
+        ok = await db.set_active_project(chat_id=message.chat.id, project_id=project.id)
+        if not ok:
+            await message.reply("Не удалось выбрать проект. Попробуй ещё раз.")
+            return
+        await message.reply(f"Активный проект: {project.name} ({project.slug})")
+
+    @router.message(Command("project_show"))
+    async def project_show(message: Message) -> None:
+        if message.chat is None:
+            return
+        active_project = await db.get_active_project(chat_id=message.chat.id)
+        if active_project is None:
+            await message.reply(
+                "Активный проект не выбран.\n"
+                "Используй /project_use <id|slug> или создай /project_new <название>."
+            )
+            return
+
+        memory = await db.get_project_memory(
+            chat_id=message.chat.id, project_id=active_project.id
+        )
+        lines = [
+            "Активный проект:",
+            f"id: {active_project.id}",
+            f"slug: {active_project.slug}",
+            f"name: {active_project.name}",
+            "",
+            "Карточка проекта:",
+        ]
+
+        added_sections = 0
+        for section in _PROJECT_SECTIONS_ORDER:
+            content = (memory.get(section) or "").strip()
+            if not content:
+                continue
+            lines.append(f"— {section}: {content}")
+            added_sections += 1
+
+        # Also show custom sections if they were ever added directly in DB.
+        for section, content in memory.items():
+            if section in _PROJECT_SECTIONS:
+                continue
+            c = (content or "").strip()
+            if not c:
+                continue
+            lines.append(f"— {section}: {c}")
+            added_sections += 1
+
+        if added_sections == 0:
+            lines.append("Пока пусто. Заполни секции через /project_set.")
+
+        await message.reply("\n".join(lines), disable_web_page_preview=True)
+
+    @router.message(Command("project_set"))
+    async def project_set(message: Message) -> None:
+        if message.chat is None:
+            return
+        raw = _parse_command_args(message.text)
+        if not raw:
+            await message.reply(
+                "Формат: /project_set <section> <content>\n"
+                "Разделы: brief, kpi, constraints, audience, hypotheses, notes"
+            )
+            return
+
+        pieces = raw.split(maxsplit=1)
+        section = pieces[0].strip().lower()
+        content = pieces[1].strip() if len(pieces) > 1 else ""
+        if section not in _PROJECT_SECTIONS:
+            await message.reply(
+                "Неизвестный раздел.\nРазрешено: brief, kpi, constraints, audience, hypotheses, notes"
+            )
+            return
+        if not content:
+            await message.reply("Пустое значение. Добавь текст после названия раздела.")
+            return
+        if len(content) > 1200:
+            await message.reply("Слишком длинный текст. Лимит: 1200 символов.")
+            return
+
+        active_project = await db.get_active_project(chat_id=message.chat.id)
+        if active_project is None:
+            await message.reply(
+                "Сначала выбери проект.\n"
+                "1) /project_new <название>\n2) или /project_use <id|slug>"
+            )
+            return
+        ok = await db.upsert_project_memory(
+            chat_id=message.chat.id,
+            project_id=active_project.id,
+            section=section,
+            content=content,
+        )
+        if not ok:
+            await message.reply("Не удалось сохранить секцию памяти проекта.")
+            return
+        await message.reply(
+            f"Сохранено в проект `{active_project.slug}`:\n"
+            f"— {section}: {content[:160]}{'…' if len(content) > 160 else ''}",
+        )
 
     # Store messages from people into SQLite.
     @router.message()

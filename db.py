@@ -19,6 +19,16 @@ class StoredMessage:
     media: dict[str, Any] | None
 
 
+@dataclass(frozen=True)
+class Project:
+    id: int
+    chat_id: int
+    slug: str
+    name: str
+    status: str
+    created_at_ts: int
+
+
 CREATE_MESSAGES_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,6 +80,38 @@ CREATE TABLE IF NOT EXISTS bot_message_sessions (
 );
 """
 
+CREATE_PROJECTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS projects (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  slug TEXT NOT NULL,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at_ts INTEGER NOT NULL,
+  UNIQUE(chat_id, slug)
+);
+"""
+
+CREATE_PROJECT_MEMORY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS project_memory (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  section TEXT NOT NULL,
+  content TEXT NOT NULL,
+  updated_at_ts INTEGER NOT NULL,
+  UNIQUE(project_id, section)
+);
+"""
+
+CREATE_CHAT_ACTIVE_PROJECT_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS chat_active_project (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL UNIQUE,
+  project_id INTEGER NOT NULL,
+  updated_at_ts INTEGER NOT NULL
+);
+"""
+
 
 class Database:
     def __init__(self, path: str) -> None:
@@ -87,6 +129,9 @@ class Database:
             + CREATE_DAILY_SUMMARIES_TABLE_SQL
             + CREATE_ASK_SESSIONS_TABLE_SQL
             + CREATE_BOT_MESSAGE_SESSIONS_TABLE_SQL
+            + CREATE_PROJECTS_TABLE_SQL
+            + CREATE_PROJECT_MEMORY_TABLE_SQL
+            + CREATE_CHAT_ACTIVE_PROJECT_TABLE_SQL
         )
         await self._conn.commit()
 
@@ -401,4 +446,198 @@ class Database:
         if row is None:
             return None
         return int(row["session_id"])
+
+    async def create_project(self, *, chat_id: int, slug: str, name: str) -> int:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+
+        created_at_ts = int(time.time())
+        cur = await self._conn.execute(
+            """
+            INSERT INTO projects (chat_id, slug, name, status, created_at_ts)
+            VALUES (?, ?, ?, 'active', ?)
+            """,
+            (chat_id, slug, name, created_at_ts),
+        )
+        await self._conn.commit()
+        return int(cur.lastrowid)
+
+    async def list_projects(self, *, chat_id: int) -> list[Project]:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+
+        cur = await self._conn.execute(
+            """
+            SELECT id, chat_id, slug, name, status, created_at_ts
+            FROM projects
+            WHERE chat_id = ?
+            ORDER BY created_at_ts DESC
+            """,
+            (chat_id,),
+        )
+        rows = await cur.fetchall()
+        out: list[Project] = []
+        for row in rows:
+            out.append(
+                Project(
+                    id=int(row["id"]),
+                    chat_id=int(row["chat_id"]),
+                    slug=str(row["slug"]),
+                    name=str(row["name"]),
+                    status=str(row["status"]),
+                    created_at_ts=int(row["created_at_ts"]),
+                )
+            )
+        return out
+
+    async def get_project_by_ref(self, *, chat_id: int, project_ref: str) -> Project | None:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+
+        project_ref_clean = (project_ref or "").strip()
+        if not project_ref_clean:
+            return None
+
+        row = None
+        if project_ref_clean.isdigit():
+            cur = await self._conn.execute(
+                """
+                SELECT id, chat_id, slug, name, status, created_at_ts
+                FROM projects
+                WHERE chat_id = ? AND id = ?
+                LIMIT 1
+                """,
+                (chat_id, int(project_ref_clean)),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            cur = await self._conn.execute(
+                """
+                SELECT id, chat_id, slug, name, status, created_at_ts
+                FROM projects
+                WHERE chat_id = ? AND slug = ?
+                LIMIT 1
+                """,
+                (chat_id, project_ref_clean.lower()),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+
+        return Project(
+            id=int(row["id"]),
+            chat_id=int(row["chat_id"]),
+            slug=str(row["slug"]),
+            name=str(row["name"]),
+            status=str(row["status"]),
+            created_at_ts=int(row["created_at_ts"]),
+        )
+
+    async def set_active_project(self, *, chat_id: int, project_id: int) -> bool:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+
+        # Guard: project must belong to this chat.
+        cur = await self._conn.execute(
+            """
+            SELECT id
+            FROM projects
+            WHERE id = ? AND chat_id = ?
+            LIMIT 1
+            """,
+            (project_id, chat_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return False
+
+        await self._conn.execute(
+            """
+            INSERT OR REPLACE INTO chat_active_project (chat_id, project_id, updated_at_ts)
+            VALUES (?, ?, ?)
+            """,
+            (chat_id, project_id, int(time.time())),
+        )
+        await self._conn.commit()
+        return True
+
+    async def get_active_project(self, *, chat_id: int) -> Project | None:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+
+        cur = await self._conn.execute(
+            """
+            SELECT p.id, p.chat_id, p.slug, p.name, p.status, p.created_at_ts
+            FROM chat_active_project cap
+            JOIN projects p ON p.id = cap.project_id
+            WHERE cap.chat_id = ?
+              AND p.chat_id = ?
+            LIMIT 1
+            """,
+            (chat_id, chat_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+
+        return Project(
+            id=int(row["id"]),
+            chat_id=int(row["chat_id"]),
+            slug=str(row["slug"]),
+            name=str(row["name"]),
+            status=str(row["status"]),
+            created_at_ts=int(row["created_at_ts"]),
+        )
+
+    async def upsert_project_memory(
+        self, *, chat_id: int, project_id: int, section: str, content: str
+    ) -> bool:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+
+        cur = await self._conn.execute(
+            """
+            SELECT id
+            FROM projects
+            WHERE id = ? AND chat_id = ?
+            LIMIT 1
+            """,
+            (project_id, chat_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return False
+
+        await self._conn.execute(
+            """
+            INSERT OR REPLACE INTO project_memory (project_id, section, content, updated_at_ts)
+            VALUES (?, ?, ?, ?)
+            """,
+            (project_id, section, content, int(time.time())),
+        )
+        await self._conn.commit()
+        return True
+
+    async def get_project_memory(
+        self, *, chat_id: int, project_id: int
+    ) -> dict[str, str]:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+
+        cur = await self._conn.execute(
+            """
+            SELECT pm.section, pm.content
+            FROM project_memory pm
+            JOIN projects p ON p.id = pm.project_id
+            WHERE pm.project_id = ?
+              AND p.chat_id = ?
+            ORDER BY pm.section ASC
+            """,
+            (project_id, chat_id),
+        )
+        rows = await cur.fetchall()
+        out: dict[str, str] = {}
+        for row in rows:
+            out[str(row["section"])] = str(row["content"])
+        return out
 

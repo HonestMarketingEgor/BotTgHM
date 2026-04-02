@@ -12,6 +12,13 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on", "y"}
+
+
 def _clean_env_value(value: str) -> str:
     """
     Trim whitespace and remove accidental surrounding quotes.
@@ -27,6 +34,7 @@ def _clean_env_value(value: str) -> str:
 class Config:
     telegram_bot_token: str
     openai_api_key: str
+    openai_base_url: str
     db_path: str
     openai_model: str
     openai_model_suggestions: str
@@ -44,6 +52,8 @@ class Config:
     url_fetch_timeout_s: int
     max_link_chars: int
     max_links: int
+    max_project_memory_chars: int
+    enable_auto_response_mode: bool
 
 
 def load_config() -> Config:
@@ -58,6 +68,7 @@ def load_config() -> Config:
 
     openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
     openai_api_key = _clean_env_value(openai_api_key)
+    openai_base_url = _clean_env_value(os.getenv("OPENAI_BASE_URL", ""))
 
     db_path = os.getenv("DB_PATH", "./data/bot.db").strip()
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
@@ -85,6 +96,7 @@ def load_config() -> Config:
     return Config(
         telegram_bot_token=telegram_bot_token,
         openai_api_key=openai_api_key,
+        openai_base_url=openai_base_url,
         db_path=db_path,
         openai_model=openai_model,
         openai_model_suggestions=openai_model_suggestions,
@@ -97,5 +109,7 @@ def load_config() -> Config:
         url_fetch_timeout_s=_env_int("URL_FETCH_TIMEOUT_S", 20),
         max_link_chars=_env_int("MAX_LINK_CHARS", 30000),
         max_links=_env_int("MAX_LINKS", 3),
+        max_project_memory_chars=_env_int("MAX_PROJECT_MEMORY_CHARS", 1800),
+        enable_auto_response_mode=_env_bool("ENABLE_AUTO_RESPONSE_MODE", True),
     )
 
