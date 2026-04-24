@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import re
 import time
 
+import httpx
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -20,6 +21,7 @@ from formatter import (
     build_help_redirect,
 )
 from llm import LLMClient
+from links import extract_urls, fetch_url_text
 from message_extract import extract_media_metadata
 from retrieval import message_to_excerpt, rank_messages
 
@@ -64,6 +66,22 @@ def _is_analysis_intent(text: str) -> bool:
         "по переписке",
         "контекст",
         "дай вывод",
+    ]
+    return any(m in q for m in markers)
+
+
+def _needs_chat_context(text: str) -> bool:
+    q = (text or "").strip().lower().replace("ё", "е")
+    markers = [
+        "по чату",
+        "в чате",
+        "по переписке",
+        "из переписки",
+        "по сообщениям",
+        "из контекста чата",
+        "что обсуждали",
+        "что было в чате",
+        "сводка чата",
     ]
     return any(m in q for m in markers)
 
@@ -347,7 +365,42 @@ async def main() -> None:
             mode = ASSISTANT_MODE
 
         context_lines: list[str] = []
-        if mode == ANALYSIS_MODE and cfg.enable_chat_analysis:
+        urls = extract_urls(q)
+        effective_question = q
+        if urls:
+            for u in urls:
+                effective_question = effective_question.replace(u, " ")
+            effective_question = re.sub(r"\s+", " ", effective_question).strip()
+            if not effective_question:
+                effective_question = "Проанализируй источник по ссылке и извлеки ключевые факты."
+
+            sem_links: int = max(1, cfg.max_links)
+            sem = asyncio.Semaphore(sem_links)
+            async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
+                link_texts: list[tuple[str, str]] = []
+
+                async def fetch_one(u: str) -> None:
+                    async with sem:
+                        eff_url, text = await fetch_url_text(
+                            u,
+                            client=client,
+                            timeout_s=cfg.url_fetch_timeout_s,
+                            max_chars=cfg.max_link_chars,
+                        )
+                        if text:
+                            link_texts.append((eff_url, text))
+
+                await asyncio.gather(*(fetch_one(u) for u in urls[: cfg.max_links]))
+
+            for eff_url, text in link_texts:
+                context_lines.append(f"[LINK] {eff_url}: {text}")
+
+        use_chat_context = (
+            mode == ANALYSIS_MODE
+            and cfg.enable_chat_analysis
+            and (forced_mode == ANALYSIS_MODE or _needs_chat_context(q))
+        )
+        if use_chat_context:
             now = datetime.now().astimezone()
             min_ts = int((now - timedelta(days=7)).timestamp())
             recent = await db.get_recent_messages_for_chat(
@@ -367,17 +420,17 @@ async def main() -> None:
 
         if llm is None:
             if mode == ANALYSIS_MODE:
-                out = build_analysis_fallback(q, context_lines)
+                out = build_analysis_fallback(effective_question, context_lines)
             else:
-                out = build_assistant_fallback(q)
+                out = build_assistant_fallback(effective_question)
             await message.reply(out, disable_web_page_preview=True)
             return
 
         try:
             result = await llm.answer(
                 mode=mode,
-                question=q,
-                context_messages=context_lines if mode == ANALYSIS_MODE else None,
+                question=effective_question,
+                context_messages=context_lines or None,
             )
             text = (result.text or "").strip() or "Не удалось сформировать ответ."
         except Exception as e:
@@ -386,9 +439,9 @@ async def main() -> None:
                 await message.reply(hint, disable_web_page_preview=True)
                 return
             if mode == ANALYSIS_MODE:
-                text = build_analysis_fallback(q, context_lines)
+                text = build_analysis_fallback(effective_question, context_lines)
             else:
-                text = build_assistant_fallback(q)
+                text = build_assistant_fallback(effective_question)
         await message.reply(text, disable_web_page_preview=True)
 
     @router.message(Command("start"))
