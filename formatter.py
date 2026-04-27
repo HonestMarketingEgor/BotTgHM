@@ -549,6 +549,7 @@ def build_help_text(bot_username: str | None = None) -> str:
             "— /reset",
             "",
             f"В группе можно писать напрямую: {mention_hint} <вопрос>",
+            "Или ответить реплаем на сообщение бота — тогда @mention не обязателен.",
         ]
     )
 

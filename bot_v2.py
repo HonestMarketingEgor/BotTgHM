@@ -337,6 +337,51 @@ async def main() -> None:
         raw = (message.text or message.caption or "").lower()
         return f"@{bot_username}" in raw
 
+    def _is_bot_origin_message(msg: Message | None) -> bool:
+        if msg is None:
+            return False
+        sender = getattr(msg, "from_user", None)
+        if sender is not None and getattr(sender, "id", None) == bot_id:
+            return True
+
+        # Backward-compatible fields (older Telegram forward metadata).
+        fwd_user = getattr(msg, "forward_from", None)
+        if fwd_user is not None and getattr(fwd_user, "id", None) == bot_id:
+            return True
+
+        # New forward metadata model in Bot API / aiogram 3.
+        origin = getattr(msg, "forward_origin", None)
+        if origin is not None:
+            sender_user = getattr(origin, "sender_user", None)
+            if sender_user is not None and getattr(sender_user, "id", None) == bot_id:
+                return True
+            sender_chat = getattr(origin, "sender_chat", None)
+            sender_chat_username = (
+                getattr(sender_chat, "username", "") or ""
+            ).strip().lower()
+            if bot_username and sender_chat_username == bot_username:
+                return True
+
+        fwd_chat = getattr(msg, "forward_from_chat", None)
+        fwd_chat_username = (getattr(fwd_chat, "username", "") or "").strip().lower()
+        if bot_username and fwd_chat_username == bot_username:
+            return True
+
+        fwd_sender_name = (getattr(msg, "forward_sender_name", "") or "").strip().lower()
+        if bot_username and bot_username in fwd_sender_name:
+            return True
+        return False
+
+    def _is_reply_to_bot_context(message: Message) -> bool:
+        reply_msg = getattr(message, "reply_to_message", None)
+        if reply_msg is None:
+            return False
+        if _is_bot_origin_message(reply_msg):
+            return True
+        # Some clients wrap forwarded messages as "reply to forward".
+        nested_reply = getattr(reply_msg, "reply_to_message", None)
+        return _is_bot_origin_message(nested_reply)
+
     def strip_bot_mention(text: str) -> str:
         if not bot_username:
             return text.strip()
@@ -844,7 +889,12 @@ async def main() -> None:
             return
 
         is_group = message.chat.type in {"group", "supergroup"}
-        if is_group and not is_bot_mentioned(message):
+        should_answer = (
+            not is_group
+            or is_bot_mentioned(message)
+            or _is_reply_to_bot_context(message)
+        )
+        if not should_answer:
             return
 
         raw = text or caption or ""
