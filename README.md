@@ -42,10 +42,13 @@ Commands like `/ask` will usually still work, but disabling privacy ensures the 
 ## Commands
 
 - `/ask <question>`: Answer using chat context (latest daily summary + relevant recent messages).
+- `/daily_summary` (or `/summary`): Build daily summary on demand for current chat (last ~24h).
 - `/VkMatch`: Starts lead matching flow in chat:
   1) bot asks for file A (`csv/xls/xlsx/pdf`);
   2) then asks for file(s) B in one message (`csv/xls/xlsx`);
   3) bot returns ready `.xlsx` with matching results + `Top` sheet + `Top combinations`.
+
+Daily summary is no longer sent automatically by schedule; it is generated only by command.
 
 If you send a plain message like “What can you do?” the bot will reply with instructions.
 

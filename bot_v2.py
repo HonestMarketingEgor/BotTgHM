@@ -14,7 +14,6 @@ from aiogram.filters import Command
 from aiogram.types import BotCommand, FSInputFile, Message
 
 from config import load_config
-from daily_loop import DailyRunParams, daily_summary_loop
 from db import Database, StoredMessage
 from formatter import (
     build_analysis_fallback,
@@ -209,6 +208,8 @@ async def main() -> None:
             [
                 BotCommand(command="help", description="Показать возможности бота"),
                 BotCommand(command="ask", description="Анализ чата: /ask <вопрос>"),
+                BotCommand(command="daily_summary", description="Сводка за 24ч по текущему чату"),
+                BotCommand(command="summary", description="Короткий алиас сводки"),
                 BotCommand(command="mode", description="Режим: assistant | analysis"),
                 BotCommand(command="chat_info", description="Текущий chat_id и название"),
                 BotCommand(command="vkmatch", description="Сопоставление лидов A vs B"),
@@ -579,6 +580,77 @@ async def main() -> None:
                 text = build_assistant_fallback(effective_question)
         await message.reply(text, disable_web_page_preview=True)
 
+    async def run_daily_summary_for_chat(chat_id: int) -> str:
+        tz = cfg.daily_timezone
+        end_dt = datetime.now().astimezone()
+        start_dt = end_dt - timedelta(hours=24)
+        start_ts = int(start_dt.timestamp())
+        end_ts = int(end_dt.timestamp())
+        date_key = end_dt.strftime("%Y-%m-%d")
+
+        msgs = await db.get_messages_for_chat_in_range(
+            chat_id=chat_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            limit=800,
+        )
+        if not msgs:
+            return "За последние 24 часа в этом чате нет данных для сводки."
+
+        excerpts = [message_to_excerpt(m) for m in msgs]
+        selected: list[str] = []
+        total_chars = 0
+        for line in excerpts:
+            extra = len(line) + 1
+            if total_chars + extra > cfg.max_context_chars:
+                break
+            selected.append(line)
+            total_chars += extra
+
+        if not selected:
+            return "Недостаточно данных для построения сводки."
+
+        if llm is not None:
+            try:
+                daily = await llm.daily_summary(
+                    chat_id=chat_id,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    message_bullets=selected,
+                )
+                summary_text = (daily.text or "").strip()
+                if not summary_text:
+                    summary_text = "Сводка не сформирована: модель вернула пустой ответ."
+            except Exception:
+                fallback = selected[:10]
+                summary_text = "Сводка (упрощённая, без LLM):\n\n" + "\n".join(
+                    [f"— {line}" for line in fallback]
+                )
+        else:
+            fallback = selected[:10]
+            summary_text = "Сводка (упрощённая, без LLM):\n\n" + "\n".join(
+                [f"— {line}" for line in fallback]
+            )
+
+        header = f"📅 Сводка по запросу за {date_key} (период ~24 ч)\n\n"
+        out_text = (header + summary_text).strip()
+        await db.insert_daily_summary(
+            chat_id=chat_id,
+            date_key=date_key,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            summary_text=out_text,
+        )
+        return out_text
+
+    async def send_text_chunks(message: Message, text: str) -> None:
+        chunk_size = 3900
+        payload = text or ""
+        while payload:
+            part = payload[:chunk_size]
+            payload = payload[chunk_size:]
+            await message.reply(part, disable_web_page_preview=True)
+
     @router.message(Command("start"))
     async def on_start(message: Message) -> None:
         await register_chat_presence(message)
@@ -627,6 +699,16 @@ async def main() -> None:
             await message.reply("Формат: /ask <вопрос>")
             return
         await answer_user_query(message=message, question=q, forced_mode=ANALYSIS_MODE)
+
+    @router.message(Command("daily_summary"))
+    @router.message(Command("summary"))
+    async def on_daily_summary(message: Message) -> None:
+        if message.chat is None:
+            return
+        await register_chat_presence(message)
+        await message.reply("Формирую сводку за последние 24 часа...")
+        out = await run_daily_summary_for_chat(message.chat.id)
+        await send_text_chunks(message, out)
 
     @router.message(Command("chat_info"))
     async def on_chat_info(message: Message) -> None:
@@ -746,25 +828,6 @@ async def main() -> None:
             return
         await answer_user_query(message=message, question=q, forced_mode=None)
 
-    params = DailyRunParams(
-        daily_hour=cfg.daily_hour,
-        daily_minute=cfg.daily_minute,
-        timezone_name=cfg.daily_timezone,
-        max_context_chars=cfg.max_context_chars,
-        messages_limit_for_summary=800,
-        lookback_hours=24,
-    )
-
-    daily_task = asyncio.create_task(
-        daily_summary_loop(
-            bot=bot,
-            db=db,
-            llm=llm,
-            allowed_chat_ids=cfg.allowed_chat_ids or [],
-            params=params,
-        )
-    )
-
     async def retention_cleanup_loop() -> None:
         while True:
             try:
@@ -789,7 +852,6 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     finally:
-        daily_task.cancel()
         retention_task.cancel()
         await db.close()
 
