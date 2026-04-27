@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import html
 from pathlib import Path
 import re
 import shutil
@@ -174,6 +175,31 @@ def _openai_failure_reply(exc: BaseException) -> str | None:
     if "timeout" in err or "connection" in err or "network" in err:
         return "Проблема сети при запросе к OpenAI. Попробуй позже."
     return None
+
+
+def _format_output_for_telegram_html(text: str) -> str:
+    """
+    Convert common markdown-like markers from LLM into Telegram HTML,
+    preserving basic typography (bold/italic/inline code).
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    # Strip markdown heading markers while keeping the text itself.
+    t = re.sub(r"(?m)^#{1,6}\s*", "", t)
+    # Escape all html-sensitive chars first.
+    t = html.escape(t, quote=False)
+    # Restore lightweight typography markers as Telegram HTML.
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t, flags=re.DOTALL)
+    t = re.sub(
+        r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)",
+        r"<i>\1</i>",
+        t,
+        flags=re.DOTALL,
+    )
+    t = re.sub(r"__([^_]+)__", r"<i>\1</i>", t)
+    t = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", t)
+    return t.strip()
 
 
 async def main() -> None:
@@ -698,7 +724,11 @@ async def main() -> None:
                 session_id = None
 
         async def _reply_and_track(text: str, *, disable_web_page_preview: bool = True) -> None:
-            sent = await message.reply(text, disable_web_page_preview=disable_web_page_preview)
+            sent = await message.reply(
+                _format_output_for_telegram_html(text),
+                disable_web_page_preview=disable_web_page_preview,
+                parse_mode="HTML",
+            )
             _mark_chat_thread_activity(chat_id=message.chat.id, session_id=session_id)
             if session_id is not None:
                 try:
