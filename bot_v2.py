@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 import re
+import shutil
 import time
 
 import httpx
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import BotCommand, FSInputFile, Message
 
 from config import load_config
 from daily_loop import DailyRunParams, daily_summary_loop
@@ -24,12 +26,17 @@ from llm import LLMClient
 from links import extract_urls, fetch_url_text
 from message_extract import extract_media_metadata
 from retrieval import message_to_excerpt, rank_messages
+from vk_match_service import run_vk_match
 
 HELP_MODE = "help_mode"
 ASSISTANT_MODE = "assistant_mode"
 ANALYSIS_MODE = "analysis_mode"
 
 VALID_CHAT_MODES = {ASSISTANT_MODE, ANALYSIS_MODE}
+VK_STAGE_WAIT_A = "wait_file_a"
+VK_STAGE_WAIT_B = "wait_files_b"
+VK_MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
+VK_SESSION_TTL_SECONDS = 2 * 3600
 
 
 @dataclass
@@ -37,11 +44,23 @@ class ChatRuntimeState:
     mode: str
 
 
+@dataclass
+class VkMatchSession:
+    stage: str
+    created_at_ts: int
+    work_dir: Path
+    file_a_path: Path | None
+    files_b_paths: list[Path]
+
+
 def _is_help_intent(text: str) -> bool:
     q = (text or "").strip().lower().replace("ё", "е")
     markers = [
         "что ты умеешь",
+        "что ты можешь",
         "что умеет бот",
+        "что может бот",
+        "что он может",
         "как пользоваться",
         "инструкция",
         "help",
@@ -185,7 +204,24 @@ async def main() -> None:
     bot_id = me.id
     bot_username = (me.username or "").strip().lower()
 
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="help", description="Показать возможности бота"),
+                BotCommand(command="ask", description="Анализ чата: /ask <вопрос>"),
+                BotCommand(command="mode", description="Режим: assistant | analysis"),
+                BotCommand(command="chat_info", description="Текущий chat_id и название"),
+                BotCommand(command="vkmatch", description="Сопоставление лидов A vs B"),
+                BotCommand(command="reset", description="Сброс режима чата"),
+            ]
+        )
+    except Exception as e:
+        print(f"[startup] set_my_commands skipped: {type(e).__name__}: {e}")
+
     runtime_state_by_chat: dict[int, ChatRuntimeState] = {}
+    vk_sessions: dict[tuple[int, int], VkMatchSession] = {}
+    vk_media_buffers: dict[tuple[int, int, str], list[Message]] = {}
+    vk_media_tasks: dict[tuple[int, int, str], asyncio.Task] = {}
     default_mode = _normalize_mode(cfg.default_mode) or ASSISTANT_MODE
 
     def _chat_state(chat_id: int) -> ChatRuntimeState:
@@ -194,6 +230,105 @@ async def main() -> None:
             st = ChatRuntimeState(mode=default_mode)
             runtime_state_by_chat[chat_id] = st
         return st
+
+    def _vk_key(message: Message) -> tuple[int, int] | None:
+        if message.chat is None or message.from_user is None:
+            return None
+        return (message.chat.id, message.from_user.id)
+
+    def _cleanup_vk_session_files(session: VkMatchSession) -> None:
+        try:
+            shutil.rmtree(session.work_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _drop_vk_session(key: tuple[int, int]) -> None:
+        session = vk_sessions.pop(key, None)
+        if session is not None:
+            _cleanup_vk_session_files(session)
+
+    async def _download_document_to_dir(message: Message, prefix: str, max_size: int) -> tuple[Path, str]:
+        if message.document is None:
+            raise ValueError("Ожидался файл-документ.")
+        doc = message.document
+        if doc.file_size and doc.file_size > max_size:
+            raise ValueError(
+                f"Файл слишком большой ({doc.file_size} байт). "
+                f"Максимум: {max_size} байт."
+            )
+        key = _vk_key(message)
+        if key is None:
+            raise ValueError("Не удалось определить сессию.")
+        session = vk_sessions.get(key)
+        if session is None:
+            raise ValueError("Сессия /VkMatch не найдена. Запустите команду заново.")
+
+        original_name = (doc.file_name or f"{prefix}_{doc.file_id}").strip()
+        ext = Path(original_name).suffix.lower()
+        safe_base = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(original_name).stem) or prefix
+        filename = f"{prefix}_{safe_base}_{int(time.time()*1000)}{ext}"
+        target = session.work_dir / filename
+
+        bio = await bot.download(doc.file_id)
+        payload = bio.getvalue() if hasattr(bio, "getvalue") else b""
+        target.write_bytes(payload)
+        return target, ext
+
+    async def _run_vk_pipeline_and_send(message: Message, session: VkMatchSession) -> None:
+        await message.reply("Файлы получил. Начал обработку, это может занять до пары минут.")
+        output_path = session.work_dir / f"vk_match_result_{int(time.time())}.xlsx"
+        try:
+            stats = await asyncio.wait_for(
+                asyncio.to_thread(run_vk_match, session.file_a_path, session.files_b_paths, output_path),
+                timeout=900,
+            )
+            await message.reply_document(
+                FSInputFile(str(output_path)),
+                caption=(
+                    "Готово.\n"
+                    f"Лидов в A: {stats.get('rows_in_a', 0)}\n"
+                    f"Сопоставлено: {stats.get('matched_rows', 0)}\n"
+                    f"Не сопоставлено: {stats.get('unmatched_rows', 0)}\n"
+                    f"Top combinations: {stats.get('combination_top', 0)}"
+                ),
+            )
+        except asyncio.TimeoutError:
+            await message.reply("Обработка заняла слишком много времени и была остановлена. Попробуйте с меньшими файлами.")
+        except Exception as e:
+            await message.reply(f"Не удалось обработать файлы: {e}")
+
+    async def _handle_vk_b_documents(message: Message, documents: list[Message]) -> None:
+        key = _vk_key(message)
+        if key is None:
+            return
+        session = vk_sessions.get(key)
+        if session is None or session.stage != VK_STAGE_WAIT_B:
+            return
+        if not documents:
+            await message.reply("Не получил файлы B. Пришлите одним сообщением один или несколько документов.")
+            return
+
+        allowed_b = {".csv", ".xls", ".xlsx"}
+        added_files: list[Path] = []
+        for doc_message in documents:
+            if doc_message.document is None:
+                continue
+            downloaded, ext = await _download_document_to_dir(doc_message, "B", VK_MAX_FILE_SIZE_BYTES)
+            if ext not in allowed_b:
+                downloaded.unlink(missing_ok=True)
+                await message.reply(
+                    "Файл B имеет неподдерживаемый формат. Допустимо: .csv, .xls, .xlsx"
+                )
+                return
+            added_files.append(downloaded)
+
+        if not added_files:
+            await message.reply("Не удалось получить файлы B. Пришлите документы еще раз.")
+            return
+
+        session.files_b_paths.extend(added_files)
+        await _run_vk_pipeline_and_send(message, session)
+        _drop_vk_session(key)
 
     def is_bot_mentioned(message: Message) -> bool:
         if not bot_username:
@@ -328,7 +463,7 @@ async def main() -> None:
             return
 
         if _is_help_intent(q):
-            await message.reply(build_help_redirect(bot_username))
+            await message.reply(build_help_text(bot_username))
             return
 
         if _is_current_chat_name_intent(q):
@@ -505,12 +640,82 @@ async def main() -> None:
             f"chat_type: {message.chat.type}"
         )
 
+    @router.message(Command("VkMatch"))
+    @router.message(Command("vkmatch"))
+    async def on_vk_match(message: Message) -> None:
+        if message.chat is None or message.from_user is None:
+            return
+        await register_chat_presence(message)
+        key = (message.chat.id, message.from_user.id)
+        old = vk_sessions.get(key)
+        if old is not None:
+            _cleanup_vk_session_files(old)
+        work_dir = Path("./data/vk_match_tmp") / f"{message.chat.id}_{message.from_user.id}_{int(time.time())}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        vk_sessions[key] = VkMatchSession(
+            stage=VK_STAGE_WAIT_A,
+            created_at_ts=int(time.time()),
+            work_dir=work_dir,
+            file_a_path=None,
+            files_b_paths=[],
+        )
+        await message.reply(
+            "Режим VkMatch запущен.\n"
+            "Шаг 1/2: пришлите файл A (csv/xls/xlsx/pdf)."
+        )
+
     @router.message()
     async def on_text(message: Message) -> None:
         if message.chat is None or message.from_user is None:
             return
         if message.from_user.id == bot_id:
             return
+
+        vk_key = (message.chat.id, message.from_user.id)
+        vk_session = vk_sessions.get(vk_key)
+        if vk_session is not None and message.document is not None:
+            await register_chat_presence(message)
+            if vk_session.stage == VK_STAGE_WAIT_A:
+                allowed_a = {".csv", ".xls", ".xlsx", ".pdf"}
+                downloaded, ext = await _download_document_to_dir(message, "A", VK_MAX_FILE_SIZE_BYTES)
+                if ext not in allowed_a:
+                    downloaded.unlink(missing_ok=True)
+                    await message.reply("Файл A должен быть формата: .csv, .xls, .xlsx или .pdf")
+                    return
+                vk_session.file_a_path = downloaded
+                vk_session.stage = VK_STAGE_WAIT_B
+                await message.reply(
+                    "Файл A принят.\n"
+                    "Шаг 2/2: пришлите одним сообщением файлы B (один или несколько, форматы .csv/.xls/.xlsx)."
+                )
+                return
+
+            if vk_session.stage == VK_STAGE_WAIT_B:
+                media_group_id = message.media_group_id
+                if media_group_id:
+                    buffer_key = (message.chat.id, message.from_user.id, media_group_id)
+                    vk_media_buffers.setdefault(buffer_key, []).append(message)
+                    existing_task = vk_media_tasks.get(buffer_key)
+                    if existing_task is not None and not existing_task.done():
+                        existing_task.cancel()
+
+                    async def _flush_media_group() -> None:
+                        try:
+                            await asyncio.sleep(1.2)
+                            items = vk_media_buffers.pop(buffer_key, [])
+                            vk_media_tasks.pop(buffer_key, None)
+                            await _handle_vk_b_documents(message, items)
+                        except asyncio.CancelledError:
+                            return
+                        except Exception as e:
+                            await message.reply(f"Ошибка обработки файлов B: {e}")
+
+                    vk_media_tasks[buffer_key] = asyncio.create_task(_flush_media_group())
+                    return
+
+                await _handle_vk_b_documents(message, [message])
+                return
+
         if message.text and message.text.strip().startswith("/"):
             return
 
@@ -566,6 +771,13 @@ async def main() -> None:
                 now_ts = int(time.time())
                 older_than_ts = now_ts - cfg.retention_days * 24 * 3600
                 await db.cleanup_old_messages(older_than_ts=older_than_ts)
+                expired_keys = [
+                    key
+                    for key, sess in vk_sessions.items()
+                    if now_ts - sess.created_at_ts > VK_SESSION_TTL_SECONDS
+                ]
+                for key in expired_keys:
+                    _drop_vk_session(key)
             except asyncio.CancelledError:
                 raise
             except Exception:
