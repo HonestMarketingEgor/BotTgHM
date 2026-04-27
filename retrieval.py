@@ -9,6 +9,7 @@ from db import StoredMessage
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]{3,}")
+_COMMAND_RE = re.compile(r"^/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s+(.*))?$")
 _STOPWORDS = {
     "the",
     "and",
@@ -57,6 +58,36 @@ _STOPWORDS = {
 }
 
 
+def _humanize_command_text(content: str) -> str:
+    raw = (content or "").strip()
+    m = _COMMAND_RE.match(raw)
+    if not m:
+        return raw
+
+    command = (m.group(1) or "").lower()
+    args = (m.group(2) or "").strip()
+    args_hint = f": {args[:120]}{'…' if len(args) > 120 else ''}" if args else ""
+
+    action_map = {
+        "start": "запустил бота и запросил стартовую инструкцию",
+        "help": "запросил список возможностей бота",
+        "ask": "запустил запрос на анализ",
+        "mode": "изменил или проверил режим работы бота",
+        "reset": "сбросил текущий режим бота",
+        "chat_info": "запросил данные о текущем чате",
+        "vkmatch": "запустил сопоставление лидов (VkMatch)",
+        "daily_summary": "запросил дневную сводку по чату",
+        "summary": "запросил дневную сводку по чату",
+        "project_new": "создал новый проект",
+        "project_list": "запросил список проектов",
+        "project_use": "сменил активный проект",
+        "project_show": "запросил карточку активного проекта",
+        "project_set": "обновил секцию памяти проекта",
+    }
+    action = action_map.get(command, f"выполнил команду /{command}")
+    return f"[ДЕЙСТВИЕ] {action}{args_hint}"
+
+
 def tokenize(text: str) -> list[str]:
     tokens = [t.lower() for t in _TOKEN_RE.findall(text or "")]
     return [t for t in tokens if t not in _STOPWORDS]
@@ -81,6 +112,8 @@ def message_to_excerpt(msg: StoredMessage) -> str:
             content += f" {name}"
 
     content = (content or "").strip()
+    if content.startswith("/"):
+        content = _humanize_command_text(content)
     if not content:
         content = "[empty]"
 

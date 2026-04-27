@@ -580,10 +580,9 @@ async def main() -> None:
                 text = build_assistant_fallback(effective_question)
         await message.reply(text, disable_web_page_preview=True)
 
-    async def run_daily_summary_for_chat(chat_id: int) -> str:
-        tz = cfg.daily_timezone
+    async def run_daily_summary_for_chat(chat_id: int, lookback_hours: int = 24) -> str:
         end_dt = datetime.now().astimezone()
-        start_dt = end_dt - timedelta(hours=24)
+        start_dt = end_dt - timedelta(hours=lookback_hours)
         start_ts = int(start_dt.timestamp())
         end_ts = int(end_dt.timestamp())
         date_key = end_dt.strftime("%Y-%m-%d")
@@ -595,7 +594,9 @@ async def main() -> None:
             limit=800,
         )
         if not msgs:
-            return "За последние 24 часа в этом чате нет данных для сводки."
+            return (
+                f"За последние {lookback_hours} ч в этом чате нет данных для сводки."
+            )
 
         excerpts = [message_to_excerpt(m) for m in msgs]
         selected: list[str] = []
@@ -632,7 +633,10 @@ async def main() -> None:
                 [f"— {line}" for line in fallback]
             )
 
-        header = f"📅 Сводка по запросу за {date_key} (период ~24 ч)\n\n"
+        header = (
+            f"📅 Сводка по запросу за {date_key} "
+            f"(период ~{lookback_hours} ч)\n\n"
+        )
         out_text = (header + summary_text).strip()
         await db.insert_daily_summary(
             chat_id=chat_id,
@@ -706,8 +710,27 @@ async def main() -> None:
         if message.chat is None:
             return
         await register_chat_presence(message)
-        await message.reply("Формирую сводку за последние 24 часа...")
-        out = await run_daily_summary_for_chat(message.chat.id)
+        arg = _parse_command_args(message.text)
+        lookback_hours = 24
+        if arg:
+            try:
+                lookback_hours = int(arg)
+            except ValueError:
+                await message.reply(
+                    "Формат: /daily_summary [часы]\n"
+                    "Пример: /daily_summary 48"
+                )
+                return
+            if lookback_hours < 1 or lookback_hours > 168:
+                await message.reply("Допустимый диапазон: от 1 до 168 часов.")
+                return
+
+        await message.reply(
+            f"Формирую сводку за последние {lookback_hours} ч..."
+        )
+        out = await run_daily_summary_for_chat(
+            message.chat.id, lookback_hours=lookback_hours
+        )
         await send_text_chunks(message, out)
 
     @router.message(Command("chat_info"))
@@ -798,8 +821,7 @@ async def main() -> None:
                 await _handle_vk_b_documents(message, [message])
                 return
 
-        if message.text and message.text.strip().startswith("/"):
-            return
+        is_command_message = bool(message.text and message.text.strip().startswith("/"))
 
         text = message.text or None
         caption = getattr(message, "caption", None) or None
@@ -817,6 +839,9 @@ async def main() -> None:
                 media=media,
             )
             await db.insert_message(stored)
+
+        if is_command_message:
+            return
 
         is_group = message.chat.type in {"group", "supergroup"}
         if is_group and not is_bot_mentioned(message):

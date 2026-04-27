@@ -37,18 +37,21 @@ This bot:
 To analyze *all* incoming information, you typically must disable the bot's privacy mode:
 - In BotFather, use `/setprivacy` and turn privacy mode off.
 
-Commands like `/ask` will usually still work, but disabling privacy ensures the bot receives messages it needs for full daily summaries.
+Commands like `/ask` will usually still work, but disabling privacy ensures the bot receives all group messages needed for complete summaries.
 
 ## Commands
 
 - `/ask <question>`: Answer using chat context (latest daily summary + relevant recent messages).
-- `/daily_summary` (or `/summary`): Build daily summary on demand for current chat (last ~24h).
+- `/daily_summary [hours]` (or `/summary [hours]`): Build summary on demand for current chat.
+  - default: last 24 hours
+  - custom range: for example, `/daily_summary 72`
 - `/VkMatch`: Starts lead matching flow in chat:
   1) bot asks for file A (`csv/xls/xlsx/pdf`);
   2) then asks for file(s) B in one message (`csv/xls/xlsx`);
   3) bot returns ready `.xlsx` with matching results + `Top` sheet + `Top combinations`.
 
 Daily summary is no longer sent automatically by schedule; it is generated only by command.
+Bot commands are included in summary context and described as user actions (not raw technical logs).
 
 If you send a plain message like “What can you do?” the bot will reply with instructions.
 
