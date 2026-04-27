@@ -559,6 +559,7 @@ async def main() -> None:
             sem = asyncio.Semaphore(sem_links)
             async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
                 link_texts: list[tuple[str, str]] = []
+                failed_links: list[str] = []
 
                 async def fetch_one(u: str) -> None:
                     async with sem:
@@ -570,11 +571,19 @@ async def main() -> None:
                         )
                         if text:
                             link_texts.append((eff_url, text))
+                        else:
+                            failed_links.append(eff_url)
 
                 await asyncio.gather(*(fetch_one(u) for u in urls[: cfg.max_links]))
 
             for eff_url, text in link_texts:
                 context_lines.append(f"[LINK] {eff_url}: {text}")
+            if not link_texts and failed_links:
+                await message.reply(
+                    "Не удалось надежно прочитать содержимое ссылки(ок) в автоматическом режиме. "
+                    "Пришли краткий текст/скрин ключевых блоков страницы — сразу разберу и дам рекомендации."
+                )
+                return
 
         use_chat_context = (
             mode == ANALYSIS_MODE

@@ -11,6 +11,22 @@ _URL_RE = re.compile(
     r"(?P<url>https?://[^\s]+|www\.[^\s]+)",
     flags=re.IGNORECASE,
 )
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+_BROWSER_HEADERS = {
+    "User-Agent": _BROWSER_USER_AGENT,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 
 def extract_urls(text: str) -> list[str]:
@@ -171,9 +187,32 @@ async def fetch_url_text(
     if drive_download:
         effective_url = drive_download
 
-    try:
-        resp = await client.get(effective_url, timeout=timeout_s, follow_redirects=True)
-    except Exception:
+    attempts = [
+        {},
+        _BROWSER_HEADERS,
+        {**_BROWSER_HEADERS, "Referer": "https://www.google.com/"},
+    ]
+    resp: httpx.Response | None = None
+    for extra_headers in attempts:
+        try:
+            resp = await client.get(
+                effective_url,
+                timeout=timeout_s,
+                follow_redirects=True,
+                headers=extra_headers or None,
+            )
+        except Exception:
+            resp = None
+            continue
+
+        # If upstream returns explicit error page, try one more browser-like attempt.
+        if resp.status_code >= 400:
+            if resp.status_code in {403, 429, 503}:
+                continue
+            return effective_url, None
+        break
+
+    if resp is None or resp.status_code >= 400:
         return effective_url, None
 
     ct = (resp.headers.get("content-type") or "").lower()
@@ -203,6 +242,14 @@ async def fetch_url_text(
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
         text = soup.get_text(separator="\n", strip=True)
+        low = text.lower()
+        # Protect LLM from anti-bot placeholder pages.
+        if (
+            "403 forbidden" in low
+            or "access denied" in low
+            or "доступ запрещ" in low
+        ) and len(text) < 1000:
+            return effective_url, None
         return effective_url, _truncate(text, max_chars)
 
     # If it looks like plain text.
