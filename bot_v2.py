@@ -36,6 +36,7 @@ VK_STAGE_WAIT_A = "wait_file_a"
 VK_STAGE_WAIT_B = "wait_files_b"
 VK_MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
 VK_SESSION_TTL_SECONDS = 2 * 3600
+THREAD_CONTEXT_TTL_SECONDS = 30 * 60
 
 
 @dataclass
@@ -223,6 +224,8 @@ async def main() -> None:
     vk_sessions: dict[tuple[int, int], VkMatchSession] = {}
     vk_media_buffers: dict[tuple[int, int, str], list[Message]] = {}
     vk_media_tasks: dict[tuple[int, int, str], asyncio.Task] = {}
+    chat_thread_expires_at: dict[int, int] = {}
+    chat_active_session_by_chat: dict[int, int] = {}
     default_mode = _normalize_mode(cfg.default_mode) or ASSISTANT_MODE
 
     def _chat_state(chat_id: int) -> ChatRuntimeState:
@@ -231,6 +234,21 @@ async def main() -> None:
             st = ChatRuntimeState(mode=default_mode)
             runtime_state_by_chat[chat_id] = st
         return st
+
+    def _is_chat_thread_active(chat_id: int) -> bool:
+        exp = chat_thread_expires_at.get(chat_id)
+        if exp is None:
+            return False
+        if int(time.time()) > exp:
+            chat_thread_expires_at.pop(chat_id, None)
+            chat_active_session_by_chat.pop(chat_id, None)
+            return False
+        return True
+
+    def _mark_chat_thread_activity(*, chat_id: int, session_id: int | None) -> None:
+        chat_thread_expires_at[chat_id] = int(time.time()) + THREAD_CONTEXT_TTL_SECONDS
+        if session_id is not None:
+            chat_active_session_by_chat[chat_id] = session_id
 
     def _vk_key(message: Message) -> tuple[int, int] | None:
         if message.chat is None or message.from_user is None:
@@ -503,6 +521,8 @@ async def main() -> None:
         question: str,
         forced_mode: str | None = None,
     ) -> None:
+        if message.chat is None:
+            return
         q = (question or "").strip()
         if not q:
             await message.reply("Напиши вопрос после команды или упоминания.")
@@ -535,9 +555,36 @@ async def main() -> None:
             if handled:
                 return
 
+        urls = extract_urls(q)
+        restored_session_question = ""
+        restored_session_lines: list[str] = []
+        restored_session_id: int | None = None
+        restored_has_links = False
+
+        reply_msg = getattr(message, "reply_to_message", None)
+        if (
+            reply_msg is not None
+            and getattr(reply_msg, "from_user", None) is not None
+            and getattr(reply_msg.from_user, "id", None) == bot_id
+        ):
+            restored_session_id = await db.get_session_by_bot_message(
+                chat_id=message.chat.id,
+                bot_message_id=reply_msg.message_id,
+            )
+        elif _is_chat_thread_active(message.chat.id):
+            restored_session_id = chat_active_session_by_chat.get(message.chat.id)
+
+        if restored_session_id is not None:
+            restored = await db.get_ask_session_by_id(session_id=restored_session_id)
+            if restored is not None:
+                restored_session_question, restored_session_lines = restored
+                restored_has_links = any(
+                    str(line).startswith("[LINK] ") for line in restored_session_lines
+                )
+
         if forced_mode:
             mode = forced_mode
-        elif _is_analysis_intent(q):
+        elif urls or restored_has_links or _is_analysis_intent(q):
             mode = ANALYSIS_MODE
         else:
             mode = _chat_state(message.chat.id).mode
@@ -546,7 +593,26 @@ async def main() -> None:
             mode = ASSISTANT_MODE
 
         context_lines: list[str] = []
-        urls = extract_urls(q)
+        context_chars = 0
+
+        def _add_context_line(line: str) -> None:
+            nonlocal context_chars
+            item = (line or "").strip()
+            if not item:
+                return
+            extra = len(item) + 1
+            if context_chars + extra > cfg.max_context_chars:
+                return
+            context_lines.append(item)
+            context_chars += extra
+
+        def _add_context_batch(lines: list[str]) -> None:
+            for line in lines:
+                _add_context_line(str(line))
+
+        if restored_session_lines and (restored_has_links or _is_chat_thread_active(message.chat.id)):
+            _add_context_batch(restored_session_lines)
+
         effective_question = q
         if urls:
             for u in urls:
@@ -577,18 +643,31 @@ async def main() -> None:
                 await asyncio.gather(*(fetch_one(u) for u in urls[: cfg.max_links]))
 
             for eff_url, text in link_texts:
-                context_lines.append(f"[LINK] {eff_url}: {text}")
+                _add_context_line(f"[LINK] {eff_url}: {text}")
             if not link_texts and failed_links:
                 await message.reply(
                     "Не удалось надежно прочитать содержимое ссылки(ок) в автоматическом режиме. "
                     "Пришли краткий текст/скрин ключевых блоков страницы — сразу разберу и дам рекомендации."
                 )
                 return
+        elif restored_has_links:
+            if not effective_question:
+                effective_question = restored_session_question or "Продолжи анализ по контексту."
+            elif "контекст предыдущего анализа" not in effective_question.lower():
+                effective_question = (
+                    f"{effective_question}\n\n"
+                    "Используй контекст предыдущего анализа ссылки из этого диалога."
+                )
 
         use_chat_context = (
             mode == ANALYSIS_MODE
             and cfg.enable_chat_analysis
-            and (forced_mode == ANALYSIS_MODE or _needs_chat_context(q))
+            and (
+                forced_mode == ANALYSIS_MODE
+                or _needs_chat_context(q)
+                or bool(urls)
+                or _is_chat_thread_active(message.chat.id)
+            )
         )
         if use_chat_context:
             now = datetime.now().astimezone()
@@ -596,24 +675,47 @@ async def main() -> None:
             recent = await db.get_recent_messages_for_chat(
                 chat_id=message.chat.id, min_ts=min_ts, limit=300
             )
-            ranked = rank_messages(q, recent)
+            rank_query = q
+            if restored_session_question and not urls:
+                rank_query = f"{restored_session_question}\n{q}"
+            ranked = rank_messages(rank_query, recent)
             selected = ranked[: cfg.max_messages_for_ask]
 
-            total_chars = 0
             for msg in selected:
                 line = message_to_excerpt(msg)
-                extra = len(line) + 1
-                if total_chars + extra > cfg.max_context_chars:
-                    break
-                context_lines.append(line)
-                total_chars += extra
+                _add_context_line(line)
+
+        session_id: int | None = None
+        if message.from_user is not None:
+            try:
+                session_id = await db.create_ask_session(
+                    chat_id=message.chat.id,
+                    user_id=message.from_user.id,
+                    question=effective_question,
+                    selected_lines=context_lines,
+                )
+            except Exception:
+                session_id = None
+
+        async def _reply_and_track(text: str, *, disable_web_page_preview: bool = True) -> None:
+            sent = await message.reply(text, disable_web_page_preview=disable_web_page_preview)
+            _mark_chat_thread_activity(chat_id=message.chat.id, session_id=session_id)
+            if session_id is not None:
+                try:
+                    await db.map_bot_message_to_session(
+                        chat_id=message.chat.id,
+                        bot_message_id=sent.message_id,
+                        session_id=session_id,
+                    )
+                except Exception:
+                    pass
 
         if llm is None:
             if mode == ANALYSIS_MODE:
                 out = build_analysis_fallback(effective_question, context_lines)
             else:
                 out = build_assistant_fallback(effective_question)
-            await message.reply(out, disable_web_page_preview=True)
+            await _reply_and_track(out, disable_web_page_preview=True)
             return
 
         try:
@@ -626,13 +728,13 @@ async def main() -> None:
         except Exception as e:
             hint = _openai_failure_reply(e)
             if hint:
-                await message.reply(hint, disable_web_page_preview=True)
+                await _reply_and_track(hint, disable_web_page_preview=True)
                 return
             if mode == ANALYSIS_MODE:
                 text = build_analysis_fallback(effective_question, context_lines)
             else:
                 text = build_assistant_fallback(effective_question)
-        await message.reply(text, disable_web_page_preview=True)
+        await _reply_and_track(text, disable_web_page_preview=True)
 
     async def run_daily_summary_for_chat(chat_id: int, lookback_hours: int = 24) -> str:
         end_dt = datetime.now().astimezone()
@@ -902,6 +1004,7 @@ async def main() -> None:
             not is_group
             or is_bot_mentioned(message)
             or _is_reply_to_bot_context(message)
+            or _is_chat_thread_active(message.chat.id)
         )
         if not should_answer:
             return
@@ -925,6 +1028,14 @@ async def main() -> None:
                 ]
                 for key in expired_keys:
                     _drop_vk_session(key)
+                expired_thread_chats = [
+                    chat_id
+                    for chat_id, exp in chat_thread_expires_at.items()
+                    if now_ts > exp
+                ]
+                for chat_id in expired_thread_chats:
+                    chat_thread_expires_at.pop(chat_id, None)
+                    chat_active_session_by_chat.pop(chat_id, None)
             except asyncio.CancelledError:
                 raise
             except Exception:

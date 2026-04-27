@@ -55,6 +55,18 @@ Bot commands are included in summary context and described as user actions (not 
 
 If you send a plain message like “What can you do?” the bot will reply with instructions.
 
+## Context follow-ups
+
+- In group chats, after bot response there is a short context window (~30 minutes).
+- During this window, participants can continue the thread without repeating `@bot` each time.
+- Replying directly to bot message also preserves context.
+
+## Link analysis behavior
+
+- If request contains URL, bot switches to analysis behavior automatically.
+- Follow-up questions like “что не так в заголовке?” reuse previous link context in the active thread.
+- Default style is adaptive and specific: 3-5 concrete fixes tied to visible page elements.
+
 ## Notes / Limitations
 
 - Media processing is limited to metadata + captions (no OCR/transcription).
