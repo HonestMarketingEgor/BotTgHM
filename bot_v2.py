@@ -37,7 +37,6 @@ VK_STAGE_WAIT_A = "wait_file_a"
 VK_STAGE_WAIT_B = "wait_files_b"
 VK_MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
 VK_SESSION_TTL_SECONDS = 2 * 3600
-THREAD_CONTEXT_TTL_SECONDS = 30 * 60
 
 
 @dataclass
@@ -250,8 +249,6 @@ async def main() -> None:
     vk_sessions: dict[tuple[int, int], VkMatchSession] = {}
     vk_media_buffers: dict[tuple[int, int, str], list[Message]] = {}
     vk_media_tasks: dict[tuple[int, int, str], asyncio.Task] = {}
-    chat_thread_expires_at: dict[int, int] = {}
-    chat_active_session_by_chat: dict[int, int] = {}
     default_mode = _normalize_mode(cfg.default_mode) or ASSISTANT_MODE
 
     def _chat_state(chat_id: int) -> ChatRuntimeState:
@@ -260,21 +257,6 @@ async def main() -> None:
             st = ChatRuntimeState(mode=default_mode)
             runtime_state_by_chat[chat_id] = st
         return st
-
-    def _is_chat_thread_active(chat_id: int) -> bool:
-        exp = chat_thread_expires_at.get(chat_id)
-        if exp is None:
-            return False
-        if int(time.time()) > exp:
-            chat_thread_expires_at.pop(chat_id, None)
-            chat_active_session_by_chat.pop(chat_id, None)
-            return False
-        return True
-
-    def _mark_chat_thread_activity(*, chat_id: int, session_id: int | None) -> None:
-        chat_thread_expires_at[chat_id] = int(time.time()) + THREAD_CONTEXT_TTL_SECONDS
-        if session_id is not None:
-            chat_active_session_by_chat[chat_id] = session_id
 
     def _vk_key(message: Message) -> tuple[int, int] | None:
         if message.chat is None or message.from_user is None:
@@ -597,8 +579,6 @@ async def main() -> None:
                 chat_id=message.chat.id,
                 bot_message_id=reply_msg.message_id,
             )
-        elif _is_chat_thread_active(message.chat.id):
-            restored_session_id = chat_active_session_by_chat.get(message.chat.id)
 
         if restored_session_id is not None:
             restored = await db.get_ask_session_by_id(session_id=restored_session_id)
@@ -636,7 +616,7 @@ async def main() -> None:
             for line in lines:
                 _add_context_line(str(line))
 
-        if restored_session_lines and (restored_has_links or _is_chat_thread_active(message.chat.id)):
+        if restored_session_lines and restored_has_links:
             _add_context_batch(restored_session_lines)
 
         effective_question = q
@@ -692,7 +672,6 @@ async def main() -> None:
                 forced_mode == ANALYSIS_MODE
                 or _needs_chat_context(q)
                 or bool(urls)
-                or _is_chat_thread_active(message.chat.id)
             )
         )
         if use_chat_context:
@@ -729,7 +708,6 @@ async def main() -> None:
                 disable_web_page_preview=disable_web_page_preview,
                 parse_mode="HTML",
             )
-            _mark_chat_thread_activity(chat_id=message.chat.id, session_id=session_id)
             if session_id is not None:
                 try:
                     await db.map_bot_message_to_session(
@@ -1034,7 +1012,6 @@ async def main() -> None:
             not is_group
             or is_bot_mentioned(message)
             or _is_reply_to_bot_context(message)
-            or _is_chat_thread_active(message.chat.id)
         )
         if not should_answer:
             return
@@ -1058,14 +1035,6 @@ async def main() -> None:
                 ]
                 for key in expired_keys:
                     _drop_vk_session(key)
-                expired_thread_chats = [
-                    chat_id
-                    for chat_id, exp in chat_thread_expires_at.items()
-                    if now_ts > exp
-                ]
-                for chat_id in expired_thread_chats:
-                    chat_thread_expires_at.pop(chat_id, None)
-                    chat_active_session_by_chat.pop(chat_id, None)
             except asyncio.CancelledError:
                 raise
             except Exception:
