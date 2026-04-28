@@ -595,7 +595,7 @@ async def main() -> None:
         if message.chat is None:
             return
         q = (question or "").strip()
-        reply_context = _reply_context_excerpt(message)
+        reply_context = _reply_context_excerpt(message, max_chars=2500)
         if not q and reply_context:
             q = f"Разбери и прокомментируй это сообщение:\n{reply_context}"
         if not q:
@@ -686,7 +686,8 @@ async def main() -> None:
         if restored_session_lines and restored_session_id is not None:
             _add_context_batch(restored_session_lines)
         elif reply_context:
-            _add_context_line(f"[REPLY] {reply_context}")
+            # Label the reply so the LLM knows where to find the exclusion list.
+            _add_context_line(f"[СПИСОК/ДАННЫЕ ИЗ REPLY] {reply_context}")
 
         if restored_bot_answer:
             _add_context_line(f"[PREV_ANSWER] {restored_bot_answer}")
@@ -756,10 +757,25 @@ async def main() -> None:
             and restored_session_question.strip() not in effective_question
             and "Исходная задача:" not in effective_question
         ):
+            # Unwrap nested "Исходная задача:" from previous turns to avoid double-wrapping.
+            original_task = restored_session_question.strip()
+            if original_task.startswith("Исходная задача:"):
+                parts = original_task.split("\n\nПользователь предоставил", 1)
+                original_task = parts[0].replace("Исходная задача:", "", 1).strip()
+
+            has_exclusion_list = any(
+                line.startswith("[СПИСОК/ДАННЫЕ ИЗ REPLY]") or line.startswith("[REPLY]")
+                for line in context_lines
+            )
+            exclusion_hint = (
+                " Если в контексте есть строка [СПИСОК/ДАННЫЕ ИЗ REPLY] со списком стран — "
+                "это список исключений, НЕ предлагай ни одну страну из него."
+                if has_exclusion_list else ""
+            )
             effective_question = (
-                f"Исходная задача: {restored_session_question}\n\n"
+                f"Исходная задача: {original_task}\n\n"
                 f"Пользователь предоставил уточнение или данные: {effective_question}\n\n"
-                "Ответь на исходную задачу с учётом новой информации."
+                f"Ответь на исходную задачу с учётом новой информации.{exclusion_hint}"
             )
 
         use_chat_context = (
