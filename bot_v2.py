@@ -76,6 +76,12 @@ def _is_analysis_intent(text: str) -> bool:
         "проанализ",
         "разбер",
         "анализ",
+        "лендинг",
+        "посадоч",
+        "страниц",
+        "сайт",
+        "cta",
+        "конверси",
         "kpi",
         "метрик",
         "cpl",
@@ -83,7 +89,6 @@ def _is_analysis_intent(text: str) -> bool:
         "сводк",
         "по чату",
         "по переписке",
-        "контекст",
         "дай вывод",
     ]
     return any(m in q for m in markers)
@@ -408,6 +413,64 @@ async def main() -> None:
         nested_reply = getattr(reply_msg, "reply_to_message", None)
         return _is_bot_origin_message(nested_reply)
 
+    def _extract_message_excerpt(msg: Message | None, max_chars: int = 700) -> str:
+        if msg is None:
+            return ""
+        parts: list[str] = []
+        txt = (getattr(msg, "text", None) or "").strip()
+        cap = (getattr(msg, "caption", None) or "").strip()
+        if txt:
+            parts.append(txt)
+        if cap and cap != txt:
+            parts.append(cap)
+        media = extract_media_metadata(msg)
+        if media and not parts:
+            parts.append(media)
+        raw = " | ".join(parts)
+        if len(raw) > max_chars:
+            return raw[: max_chars - 1].rstrip() + "…"
+        return raw
+
+    def _reply_context_excerpt(message: Message, max_chars: int = 700) -> str:
+        reply_msg = getattr(message, "reply_to_message", None)
+        if reply_msg is None:
+            return ""
+        excerpt = _extract_message_excerpt(reply_msg, max_chars=max_chars)
+        if excerpt:
+            return excerpt
+        nested_reply = getattr(reply_msg, "reply_to_message", None)
+        return _extract_message_excerpt(nested_reply, max_chars=max_chars)
+
+    def _session_lookup_ids_from_reply(message: Message) -> list[int]:
+        reply_msg = getattr(message, "reply_to_message", None)
+        if reply_msg is None:
+            return []
+        candidates = [reply_msg, getattr(reply_msg, "reply_to_message", None)]
+        out: list[int] = []
+        seen: set[int] = set()
+        for item in candidates:
+            if item is None or not _is_bot_origin_message(item):
+                continue
+            direct_id = getattr(item, "message_id", None)
+            if isinstance(direct_id, int) and direct_id not in seen:
+                seen.add(direct_id)
+                out.append(direct_id)
+            fwd_id = getattr(item, "forward_from_message_id", None)
+            if isinstance(fwd_id, int) and fwd_id not in seen:
+                seen.add(fwd_id)
+                out.append(fwd_id)
+            origin = getattr(item, "forward_origin", None)
+            if origin is not None:
+                origin_message_id = getattr(origin, "message_id", None)
+                if isinstance(origin_message_id, int) and origin_message_id not in seen:
+                    seen.add(origin_message_id)
+                    out.append(origin_message_id)
+                sender_message_id = getattr(origin, "sender_message_id", None)
+                if isinstance(sender_message_id, int) and sender_message_id not in seen:
+                    seen.add(sender_message_id)
+                    out.append(sender_message_id)
+        return out
+
     def strip_bot_mention(text: str) -> str:
         if not bot_username:
             return text.strip()
@@ -532,6 +595,9 @@ async def main() -> None:
         if message.chat is None:
             return
         q = (question or "").strip()
+        reply_context = _reply_context_excerpt(message)
+        if not q and reply_context:
+            q = f"Разбери и прокомментируй это сообщение:\n{reply_context}"
         if not q:
             await message.reply("Напиши вопрос после команды или упоминания.")
             return
@@ -569,16 +635,13 @@ async def main() -> None:
         restored_session_id: int | None = None
         restored_has_links = False
 
-        reply_msg = getattr(message, "reply_to_message", None)
-        if (
-            reply_msg is not None
-            and getattr(reply_msg, "from_user", None) is not None
-            and getattr(reply_msg.from_user, "id", None) == bot_id
-        ):
+        for candidate_id in _session_lookup_ids_from_reply(message):
             restored_session_id = await db.get_session_by_bot_message(
                 chat_id=message.chat.id,
-                bot_message_id=reply_msg.message_id,
+                bot_message_id=candidate_id,
             )
+            if restored_session_id is not None:
+                break
 
         if restored_session_id is not None:
             restored = await db.get_ask_session_by_id(session_id=restored_session_id)
@@ -588,9 +651,12 @@ async def main() -> None:
                     str(line).startswith("[LINK] ") for line in restored_session_lines
                 )
 
+        analysis_intent = _is_analysis_intent(q)
         if forced_mode:
             mode = forced_mode
-        elif urls or restored_has_links or _is_analysis_intent(q):
+        elif analysis_intent:
+            mode = ANALYSIS_MODE
+        elif restored_has_links and restored_session_id is not None:
             mode = ANALYSIS_MODE
         else:
             mode = _chat_state(message.chat.id).mode
@@ -616,8 +682,10 @@ async def main() -> None:
             for line in lines:
                 _add_context_line(str(line))
 
-        if restored_session_lines and restored_has_links:
+        if restored_session_lines and restored_session_id is not None:
             _add_context_batch(restored_session_lines)
+        elif reply_context:
+            _add_context_line(f"[REPLY] {reply_context}")
 
         effective_question = q
         if urls:
@@ -625,7 +693,18 @@ async def main() -> None:
                 effective_question = effective_question.replace(u, " ")
             effective_question = re.sub(r"\s+", " ", effective_question).strip()
             if not effective_question:
-                effective_question = "Проанализируй источник по ссылке и извлеки ключевые факты."
+                if restored_session_question:
+                    effective_question = (
+                        f"{restored_session_question}\n\n"
+                        "Используй новую ссылку как дополнительный источник фактов."
+                    )
+                elif analysis_intent:
+                    effective_question = "Проанализируй источник по ссылке и извлеки ключевые факты."
+                else:
+                    effective_question = (
+                        "Используй содержимое ссылки как источник фактов и ответь в контексте диалога. "
+                        "Если задача неясна, попроси уточнение у пользователя."
+                    )
 
             sem_links: int = max(1, cfg.max_links)
             sem = asyncio.Semaphore(sem_links)
@@ -656,7 +735,7 @@ async def main() -> None:
                     "Пришли краткий текст/скрин ключевых блоков страницы — сразу разберу и дам рекомендации."
                 )
                 return
-        elif restored_has_links:
+        elif restored_has_links and mode == ANALYSIS_MODE:
             if not effective_question:
                 effective_question = restored_session_question or "Продолжи анализ по контексту."
             elif "контекст предыдущего анализа" not in effective_question.lower():
@@ -1018,7 +1097,7 @@ async def main() -> None:
 
         raw = text or caption or ""
         q = strip_bot_mention(raw) if is_group else raw.strip()
-        if not q:
+        if not q and getattr(message, "reply_to_message", None) is None:
             return
         await answer_user_query(message=message, question=q, forced_mode=None)
 
