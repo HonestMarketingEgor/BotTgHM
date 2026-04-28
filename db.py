@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS ask_sessions (
   user_id INTEGER NOT NULL,
   created_at_ts INTEGER NOT NULL,
   question TEXT NOT NULL,
-  selected_lines_json TEXT NOT NULL
+  selected_lines_json TEXT NOT NULL,
+  bot_answer TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -167,6 +168,14 @@ class Database:
             + CREATE_LONG_TERM_FACTS_TABLE_SQL
         )
         await self._conn.commit()
+        # Migration: add bot_answer column if it doesn't exist yet (old DBs).
+        try:
+            await self._conn.execute(
+                "ALTER TABLE ask_sessions ADD COLUMN bot_answer TEXT NOT NULL DEFAULT ''"
+            )
+            await self._conn.commit()
+        except Exception:
+            pass
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -418,13 +427,13 @@ class Database:
 
     async def get_ask_session_by_id(
         self, *, session_id: int
-    ) -> tuple[str, list[str]] | None:
+    ) -> tuple[str, list[str], str] | None:
         if self._conn is None:
             raise RuntimeError("DB not connected")
 
         cur = await self._conn.execute(
             """
-            SELECT question, selected_lines_json
+            SELECT question, selected_lines_json, bot_answer
             FROM ask_sessions
             WHERE id = ?
             LIMIT 1
@@ -441,7 +450,19 @@ class Database:
         if not isinstance(selected_lines, list):
             selected_lines = []
         selected_lines_str = [str(x) for x in selected_lines]
-        return question, selected_lines_str
+        bot_answer = str(row["bot_answer"] or "")
+        return question, selected_lines_str, bot_answer
+
+    async def update_session_bot_answer(
+        self, *, session_id: int, bot_answer: str
+    ) -> None:
+        if self._conn is None:
+            raise RuntimeError("DB not connected")
+        await self._conn.execute(
+            "UPDATE ask_sessions SET bot_answer = ? WHERE id = ?",
+            (bot_answer, session_id),
+        )
+        await self._conn.commit()
 
     async def map_bot_message_to_session(
         self, *, chat_id: int, bot_message_id: int, session_id: int

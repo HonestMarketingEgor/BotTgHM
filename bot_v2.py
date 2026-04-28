@@ -634,6 +634,7 @@ async def main() -> None:
         restored_session_lines: list[str] = []
         restored_session_id: int | None = None
         restored_has_links = False
+        restored_bot_answer = ""
 
         for candidate_id in _session_lookup_ids_from_reply(message):
             restored_session_id = await db.get_session_by_bot_message(
@@ -646,7 +647,7 @@ async def main() -> None:
         if restored_session_id is not None:
             restored = await db.get_ask_session_by_id(session_id=restored_session_id)
             if restored is not None:
-                restored_session_question, restored_session_lines = restored
+                restored_session_question, restored_session_lines, restored_bot_answer = restored
                 restored_has_links = any(
                     str(line).startswith("[LINK] ") for line in restored_session_lines
                 )
@@ -686,6 +687,9 @@ async def main() -> None:
             _add_context_batch(restored_session_lines)
         elif reply_context:
             _add_context_line(f"[REPLY] {reply_context}")
+
+        if restored_bot_answer:
+            _add_context_line(f"[PREV_ANSWER] {restored_bot_answer}")
 
         effective_question = q
         if urls:
@@ -807,6 +811,13 @@ async def main() -> None:
                         chat_id=message.chat.id,
                         bot_message_id=sent.message_id,
                         session_id=session_id,
+                    )
+                except Exception:
+                    pass
+                try:
+                    await db.update_session_bot_answer(
+                        session_id=session_id,
+                        bot_answer=text,
                     )
                 except Exception:
                     pass
