@@ -744,6 +744,20 @@ async def main() -> None:
                     "Используй контекст предыдущего анализа ссылки из этого диалога."
                 )
 
+        # When user replies to a bot message, merge original task so the LLM
+        # understands this is a continuation, not a standalone query.
+        if (
+            restored_session_id is not None
+            and restored_session_question
+            and restored_session_question.strip() not in effective_question
+            and "Исходная задача:" not in effective_question
+        ):
+            effective_question = (
+                f"Исходная задача: {restored_session_question}\n\n"
+                f"Пользователь предоставил уточнение или данные: {effective_question}\n\n"
+                "Ответь на исходную задачу с учётом новой информации."
+            )
+
         use_chat_context = (
             mode == ANALYSIS_MODE
             and cfg.enable_chat_analysis
